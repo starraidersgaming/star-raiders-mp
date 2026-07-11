@@ -1,0 +1,14 @@
+{
+  "name": "star-raiders-mp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Realtime WebSocket sector sync for Star Raiders (zero npm deps)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
