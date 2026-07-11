@@ -2,8 +2,8 @@
 """
 Star Raiders — realtime sector sync server (Python 3.10+, stdlib only)
 
-Rooms are per areaIndex. Host = first nick sorted. Tick ~20 Hz.
-Env: PORT=8787  TICK_HZ=20
+Rooms are per areaIndex. Host = first nick sorted. Tick ~30 Hz.
+Env: PORT=8787  TICK_HZ=30
 
   py -3 server.py
 """
@@ -21,7 +21,7 @@ import time
 from typing import Any, Dict, Optional
 
 PORT = int(os.environ.get("PORT", "8787"))
-TICK_HZ = float(os.environ.get("TICK_HZ", "20"))
+TICK_HZ = float(os.environ.get("TICK_HZ", "30"))
 TICK_MS = max(0.016, 1.0 / TICK_HZ)
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
