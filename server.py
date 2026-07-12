@@ -108,6 +108,9 @@ class SectorRoom:
         self.enemies: Optional[dict] = None
         self.kills: Dict[str, float] = {}
         self.last_enemy_at = 0.0
+        self.debris: Optional[dict] = None
+        self.debris_kills: Dict[str, float] = {}
+        self.last_debris_at = 0.0
 
     def pick_host(self) -> None:
         nicks = sorted(self.clients.keys())
@@ -187,6 +190,17 @@ class SectorRoom:
                     "kills": self.kills,
                 }
             )
+        if self.debris is not None:
+            client.send(
+                {
+                    "t": "debris",
+                    "updatedAt": self.last_debris_at,
+                    "host": self.host,
+                    "areaIndex": self.area_index,
+                    "debris": self.debris,
+                    "kills": self.debris_kills,
+                }
+            )
         return client
 
     def leave(self, nick: str) -> None:
@@ -200,6 +214,8 @@ class SectorRoom:
         if self.host == nick:
             self.enemies = None
             self.kills = {}
+            self.debris = None
+            self.debris_kills = {}
             self.pick_host()
 
     def on_state(self, nick: str, msg: dict) -> None:
@@ -277,12 +293,17 @@ class SectorRoom:
             "hp": max(0, float(msg.get("hp") or 0)),
             "dmg": max(0, float(msg.get("dmg") or 0)),
             "kill": kill,
+            "kind": msg.get("kind"),
             "x": msg.get("x"),
             "y": msg.get("y"),
             "ts": int(time.time() * 1000),
         }
         if kill and sync_id:
-            self.kills[str(sync_id)] = time.time() * 1000
+            sid = str(sync_id)
+            if sid.startswith("d"):
+                self.debris_kills[sid] = time.time() * 1000
+            else:
+                self.kills[sid] = time.time() * 1000
         self.broadcast(payload, None)
 
     def on_enemies(self, nick: str, msg: dict) -> None:
@@ -305,6 +326,30 @@ class SectorRoom:
                 "areaIndex": self.area_index,
                 "enemies": self.enemies,
                 "kills": self.kills,
+            },
+            nick,
+        )
+
+    def on_debris(self, nick: str, msg: dict) -> None:
+        c = self.clients.get(nick)
+        if not c or not c.is_host:
+            return
+        debris = msg.get("debris")
+        self.debris = debris if isinstance(debris, dict) else {}
+        kills = msg.get("kills")
+        if isinstance(kills, dict):
+            self.debris_kills.update(kills)
+        now = time.time() * 1000
+        self.debris_kills = {k: v for k, v in self.debris_kills.items() if now - float(v) < 3000}
+        self.last_debris_at = now
+        self.broadcast(
+            {
+                "t": "debris",
+                "updatedAt": now,
+                "host": self.host,
+                "areaIndex": self.area_index,
+                "debris": self.debris,
+                "kills": self.debris_kills,
             },
             nick,
         )
@@ -354,6 +399,8 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
             room.on_hit(nick, msg)
         elif t == "enemies":
             room.on_enemies(nick, msg)
+        elif t == "debris":
+            room.on_debris(nick, msg)
         elif t == "switch":
             next_area = int(msg.get("areaIndex") or 0)
             if next_area != area:
