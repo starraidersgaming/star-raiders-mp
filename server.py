@@ -215,7 +215,40 @@ class SectorRoom:
                 s[k] = int(msg[k])
         if "inHangar" in msg:
             s["inHangar"] = bool(msg["inHangar"])
+        for k in ("isGM", "isMod", "hasBetaBadge", "isRankOne"):
+            if k in msg:
+                s[k] = bool(msg[k])
+        if "killPoints" in msg and msg["killPoints"] is not None:
+            try:
+                s["killPoints"] = int(msg["killPoints"])
+            except (TypeError, ValueError):
+                pass
         s["lastActive"] = time.time() * 1000
+        # Relay immediately so remote ships don't wait on the room tick (avoids freeze/hitch)
+        self.broadcast(
+            {
+                "t": "state",
+                "nick": nick,
+                "x": s["x"],
+                "y": s["y"],
+                "vx": s["vx"],
+                "vy": s["vy"],
+                "angle": s["angle"],
+                "shipIndex": s["shipIndex"],
+                "hp": s["hp"],
+                "maxHp": s["maxHp"],
+                "shield": s["shield"],
+                "maxShield": s["maxShield"],
+                "drones": s["drones"],
+                "inHangar": s["inHangar"],
+                "isGM": s.get("isGM", False),
+                "isMod": s.get("isMod", False),
+                "hasBetaBadge": s.get("hasBetaBadge", False),
+                "isRankOne": s.get("isRankOne", False),
+                "killPoints": s.get("killPoints", 0),
+            },
+            nick,
+        )
 
     def on_shot(self, nick: str, msg: dict) -> None:
         self.broadcast(
@@ -229,7 +262,7 @@ class SectorRoom:
                 "asset": msg.get("asset") or "laser_player",
                 "vx": msg.get("vx"),
                 "vy": msg.get("vy"),
-                "t": int(time.time() * 1000),
+                "ts": int(time.time() * 1000),
             },
             nick,
         )
