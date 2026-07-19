@@ -115,6 +115,12 @@ class SectorRoom:
         self.last_debris_at = 0.0
 
     def pick_host(self) -> None:
+        # Sticky host: keep the current host until they leave.
+        # Re-electing by nick sort on every join freezes the previous host's local AI.
+        if self.host and self.host in self.clients:
+            for c in self.clients.values():
+                c.is_host = c.nick == self.host
+            return
         nicks = sorted(self.clients.keys())
         self.host = nicks[0] if nicks else None
         for c in self.clients.values():
@@ -170,7 +176,11 @@ class SectorRoom:
             "lastActive": time.time() * 1000,
         }
         self.clients[nick] = client
-        self.pick_host()
+        # Only elect (and announce) when the room has no living host — keep sticky host on join.
+        if not self.host or self.host not in self.clients:
+            self.pick_host()
+        else:
+            client.is_host = client.nick == self.host
         client.send(
             {
                 "t": "welcome",
