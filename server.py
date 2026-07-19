@@ -106,9 +106,11 @@ class SectorRoom:
         self.clients: Dict[str, Client] = {}
         self.host: Optional[str] = None
         self.enemies: Optional[dict] = None
+        self.enemy_shots: list = []
         self.kills: Dict[str, float] = {}
         self.last_enemy_at = 0.0
         self.debris: Optional[dict] = None
+        self.rocks: dict = {}
         self.debris_kills: Dict[str, float] = {}
         self.last_debris_at = 0.0
 
@@ -188,6 +190,8 @@ class SectorRoom:
                     "areaIndex": self.area_index,
                     "enemies": self.enemies,
                     "kills": self.kills,
+                    "shots": self.enemy_shots,
+                    "full": 1,
                 }
             )
         if self.debris is not None:
@@ -199,6 +203,8 @@ class SectorRoom:
                     "areaIndex": self.area_index,
                     "debris": self.debris,
                     "kills": self.debris_kills,
+                    "rocks": self.rocks,
+                    "full": 1,
                 }
             )
         return client
@@ -213,8 +219,10 @@ class SectorRoom:
             return
         if self.host == nick:
             self.enemies = None
+            self.enemy_shots = []
             self.kills = {}
             self.debris = None
+            self.rocks = {}
             self.debris_kills = {}
             self.pick_host()
 
@@ -312,6 +320,8 @@ class SectorRoom:
             return
         enemies = msg.get("enemies")
         self.enemies = enemies if isinstance(enemies, dict) else {}
+        shots = msg.get("shots")
+        self.enemy_shots = shots[-80:] if isinstance(shots, list) else []
         kills = msg.get("kills")
         if isinstance(kills, dict):
             self.kills.update(kills)
@@ -326,6 +336,8 @@ class SectorRoom:
                 "areaIndex": self.area_index,
                 "enemies": self.enemies,
                 "kills": self.kills,
+                "shots": self.enemy_shots,
+                "full": 1,
             },
             nick,
         )
@@ -336,6 +348,8 @@ class SectorRoom:
             return
         debris = msg.get("debris")
         self.debris = debris if isinstance(debris, dict) else {}
+        rocks = msg.get("rocks")
+        self.rocks = rocks if isinstance(rocks, dict) else {}
         kills = msg.get("kills")
         if isinstance(kills, dict):
             self.debris_kills.update(kills)
@@ -350,6 +364,8 @@ class SectorRoom:
                 "areaIndex": self.area_index,
                 "debris": self.debris,
                 "kills": self.debris_kills,
+                "rocks": self.rocks,
+                "full": 1,
             },
             nick,
         )
