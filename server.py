@@ -443,6 +443,37 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
             room.on_enemies(nick, msg)
         elif t == "debris":
             room.on_debris(nick, msg)
+        elif t == "syncPlease":
+            # Non-host can request a fresh enemy snapshot (and cached copy) at any time.
+            if room.host and room.host in room.clients:
+                room.clients[room.host].send({"t": "syncPlease", "areaIndex": room.area_index})
+            if room.enemies is not None and nick != room.host:
+                room.clients[nick].send(
+                    {
+                        "t": "enemies",
+                        "updatedAt": room.last_enemy_at,
+                        "seq": room.last_enemy_seq or None,
+                        "host": room.host,
+                        "areaIndex": room.area_index,
+                        "enemies": room.enemies,
+                        "kills": room.kills,
+                        "shots": room.enemy_shots,
+                        "full": 1,
+                    }
+                )
+            if room.debris is not None and nick != room.host:
+                room.clients[nick].send(
+                    {
+                        "t": "debris",
+                        "updatedAt": room.last_debris_at,
+                        "host": room.host,
+                        "areaIndex": room.area_index,
+                        "debris": room.debris,
+                        "kills": room.debris_kills,
+                        "rocks": room.rocks,
+                        "full": 1,
+                    }
+                )
         elif t == "switch":
             next_area = int(msg.get("areaIndex") or 0)
             if next_area != area:
