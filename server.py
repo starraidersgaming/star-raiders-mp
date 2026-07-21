@@ -173,6 +173,7 @@ class SectorRoom:
             "isGM": bool(msg.get("isGM")),
             "isMod": bool(msg.get("isMod")),
             "killPoints": int(msg.get("killPoints") or 0),
+            "activeTitle": str(msg.get("activeTitle") or "")[:48] or None,
             "lastActive": time.time() * 1000,
         }
         self.clients[nick] = client
@@ -257,6 +258,9 @@ class SectorRoom:
                 s["killPoints"] = int(msg["killPoints"])
             except (TypeError, ValueError):
                 pass
+        if "activeTitle" in msg:
+            title = str(msg.get("activeTitle") or "").strip()[:48]
+            s["activeTitle"] = title or None
         s["lastActive"] = time.time() * 1000
         # Relay immediately so remote ships don't wait on the room tick (avoids freeze/hitch)
         self.broadcast(
@@ -280,6 +284,7 @@ class SectorRoom:
                 "hasBetaBadge": s.get("hasBetaBadge", False),
                 "isRankOne": s.get("isRankOne", False),
                 "killPoints": s.get("killPoints", 0),
+                "activeTitle": s.get("activeTitle"),
             },
             nick,
         )
