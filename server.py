@@ -35,14 +35,14 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 # Minimal enemy catalog (index -> stats). Matches client ft[] basics.
 ENEMY_TYPES = [
-    {"t": 0, "h": 40, "s": 100, "d": 10, "xp": 15, "c": 10, "r": 20},
-    {"t": 1, "h": 150, "s": 60, "d": 25, "xp": 45, "c": 30, "r": 30},
-    {"t": 2, "h": 400, "s": 120, "d": 60, "xp": 100, "c": 60, "r": 25},
-    {"t": 3, "h": 1000, "s": 80, "d": 150, "xp": 250, "c": 150, "r": 40},
-    {"t": 4, "h": 2500, "s": 140, "d": 350, "xp": 600, "c": 350, "r": 30},
-    {"t": 5, "h": 6000, "s": 90, "d": 600, "xp": 1200, "c": 700, "r": 50},
-    {"t": 6, "h": 12000, "s": 150, "d": 1000, "xp": 2500, "c": 1500, "r": 22},
-    {"t": 7, "h": 20000, "s": 70, "d": 1500, "xp": 4000, "c": 2500, "r": 45},
+    {"t": 0, "h": 40, "s": 100, "d": 10, "xp": 15, "c": 10, "r": 20, "fr": 0.5},
+    {"t": 1, "h": 150, "s": 60, "d": 25, "xp": 45, "c": 30, "r": 30, "fr": 1.0},
+    {"t": 2, "h": 400, "s": 120, "d": 60, "xp": 100, "c": 60, "r": 25, "fr": 1.2},
+    {"t": 3, "h": 1000, "s": 80, "d": 150, "xp": 250, "c": 150, "r": 40, "fr": 1.5},
+    {"t": 4, "h": 2500, "s": 140, "d": 350, "xp": 600, "c": 350, "r": 30, "fr": 2.0},
+    {"t": 5, "h": 6000, "s": 90, "d": 600, "xp": 1200, "c": 700, "r": 50, "fr": 2.2},
+    {"t": 6, "h": 12000, "s": 150, "d": 1000, "xp": 2500, "c": 1500, "r": 22, "fr": 2.5},
+    {"t": 7, "h": 20000, "s": 70, "d": 1500, "xp": 4000, "c": 2500, "r": 45, "fr": 2.0},
 ]
 
 
@@ -285,8 +285,10 @@ class SectorRoom:
             "d": typ["d"],
             "c": typ["c"],
             "xp": typ["xp"],
+            "fr": float(typ.get("fr") or 1.0),
             "aggro_until": 0.0,
             "retarget": 0.0,
+            "last_fire": 0.0,
         }
 
     def nearest_pilot(self, x: float, y: float) -> Optional[Tuple[str, float, float, float]]:
@@ -321,7 +323,7 @@ class SectorRoom:
 
             pilot = self.nearest_pilot(e["x"], e["y"])
             aggro = e.get("aggro_until", 0) > now
-            if pilot and pilot[3] < 550:
+            if pilot and pilot[3] < 420:
                 aggro = True
                 e["aggro_until"] = now + 8.0
             e["g"] = 1 if aggro else 0
@@ -361,6 +363,36 @@ class SectorRoom:
             e["x"] = max(40.0, min(WORLD - 40.0, e["x"]))
             e["y"] = max(40.0, min(WORLD - 40.0, e["y"]))
 
+            # Fire at nearest pilot while aggro
+            if aggro and pilot and pilot[3] < 420:
+                fr = max(0.35, float(e.get("fr") or 1.0))
+                if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
+                    e["last_fire"] = now
+                    aim = math.atan2(pilot[2] - e["y"], pilot[1] - e["x"])
+                    miss = random.random() < 0.18
+                    if miss:
+                        aim += (1 if random.random() < 0.5 else -1) * (0.22 + random.random() * 0.18)
+                    spd = 400.0
+                    self._shot_seq = getattr(self, "_shot_seq", 0) + 1
+                    self.enemy_shots.append(
+                        {
+                            "id": f"{self.area_index}:SERVER:{int(now*1000)}:{self._shot_seq}",
+                            "areaIndex": self.area_index,
+                            "sourceEnemyId": sid,
+                            "targetNick": pilot[0],
+                            "x": round(e["x"], 1),
+                            "y": round(e["y"], 1),
+                            "vx": round(math.cos(aim) * spd, 2),
+                            "vy": round(math.sin(aim) * spd, 2),
+                            "angle": round(aim, 3),
+                            "damage": int(e["d"]),
+                            "willMiss": 1 if miss else 0,
+                            "createdAt": int(now * 1000),
+                        }
+                    )
+                    if len(self.enemy_shots) > 80:
+                        self.enemy_shots = self.enemy_shots[-80:]
+
         for sid in dead_ids:
             self.enemy_ents.pop(sid, None)
             self.kills[sid] = time.time() * 1000
@@ -369,6 +401,10 @@ class SectorRoom:
         cap = enemy_cap(self.area_index)
         while len(self.enemy_ents) < cap:
             self.spawn_one()
+
+        # Drop stale shot events
+        now_ms = time.time() * 1000
+        self.enemy_shots = [sh for sh in self.enemy_shots if now_ms - float(sh.get("createdAt") or 0) < 3500]
 
         self.broadcast_enemies()
 
@@ -419,6 +455,7 @@ class SectorRoom:
         e["g"] = 1
         e["aggro_until"] = time.time() + 10.0
         kill = e["h"] <= 0
+        hp_left = 0 if kill else int(e["h"])
         if kill:
             self.kills[sync_id] = time.time() * 1000
             self.enemy_ents.pop(sync_id, None)
@@ -427,7 +464,7 @@ class SectorRoom:
                 "t": "hit",
                 "by": nick,
                 "syncId": sync_id,
-                "hp": int(e["h"]) if not kill else 0,
+                "hp": hp_left,
                 "dmg": dmg,
                 "kill": kill,
                 "kind": kind,
@@ -437,6 +474,11 @@ class SectorRoom:
             },
             None,
         )
+        # Push fresh enemy world immediately so HP/deaths don't wait for the next AI tick.
+        self.broadcast_enemies()
+        if kill and len(self.enemy_ents) < enemy_cap(self.area_index):
+            self.spawn_one()
+            self.broadcast_enemies()
 
     def join(self, client: Client, msg: dict) -> Optional[Client]:
         nick = str(msg.get("nick") or "")[:24]
