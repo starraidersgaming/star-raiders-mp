@@ -109,6 +109,7 @@ class SectorRoom:
         self.enemy_shots: list = []
         self.kills: Dict[str, float] = {}
         self.last_enemy_at = 0.0
+        self.last_enemy_seq = 0
         self.debris: Optional[dict] = None
         self.rocks: dict = {}
         self.debris_kills: Dict[str, float] = {}
@@ -192,11 +193,15 @@ class SectorRoom:
             }
         )
         self.broadcast({"t": "join", "nick": nick, "player": {"nick": nick, **client.state}}, nick)
+        # Ask sticky host to push a fresh enemy/debris snapshot for the joiner.
+        if self.host and self.host in self.clients and self.host != nick:
+            self.clients[self.host].send({"t": "syncPlease", "areaIndex": self.area_index})
         if self.enemies is not None:
             client.send(
                 {
                     "t": "enemies",
                     "updatedAt": self.last_enemy_at,
+                    "seq": self.last_enemy_seq or None,
                     "host": self.host,
                     "areaIndex": self.area_index,
                     "enemies": self.enemies,
@@ -232,6 +237,7 @@ class SectorRoom:
             self.enemies = None
             self.enemy_shots = []
             self.kills = {}
+            self.last_enemy_seq = 0
             self.debris = None
             self.rocks = {}
             self.debris_kills = {}
@@ -341,21 +347,26 @@ class SectorRoom:
         if isinstance(kills, dict):
             self.kills.update(kills)
         now = time.time() * 1000
+        if msg.get("seq") is not None:
+            try:
+                self.last_enemy_seq = int(msg.get("seq"))
+            except (TypeError, ValueError):
+                pass
         self.kills = {k: v for k, v in self.kills.items() if now - float(v) < 3000}
         self.last_enemy_at = now
-        self.broadcast(
-            {
-                "t": "enemies",
-                "updatedAt": now,
-                "host": self.host,
-                "areaIndex": self.area_index,
-                "enemies": self.enemies,
-                "kills": self.kills,
-                "shots": self.enemy_shots,
-                "full": 1,
-            },
-            nick,
-        )
+        out = {
+            "t": "enemies",
+            "updatedAt": now,
+            "host": self.host,
+            "areaIndex": self.area_index,
+            "enemies": self.enemies,
+            "kills": self.kills,
+            "shots": self.enemy_shots,
+            "full": 1,
+        }
+        if self.last_enemy_seq:
+            out["seq"] = self.last_enemy_seq
+        self.broadcast(out, nick)
 
     def on_debris(self, nick: str, msg: dict) -> None:
         c = self.clients.get(nick)
@@ -481,8 +492,10 @@ def client_thread(sock: socket.socket) -> None:
 
 
 def tick_loop() -> None:
+    # Roster heartbeat only — poses are relayed immediately on state.
+    # Keep this slower so clients are not hammered with full snapshots.
     while True:
-        time.sleep(TICK_MS)
+        time.sleep(max(TICK_MS, 0.25))
         with lock:
             for room in list(rooms.values()):
                 if not room.clients:
