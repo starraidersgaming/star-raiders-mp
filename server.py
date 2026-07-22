@@ -295,7 +295,8 @@ class SectorRoom:
 
     def enemy_payload(self) -> dict:
         now = time.time() * 1000
-        self.kills = {k: v for k, v in self.kills.items() if now - float(v) < 3000}
+        # Keep kill tombstones long enough that late/stale snaps cannot resurrect foes.
+        self.kills = {k: v for k, v in self.kills.items() if now - float(v) < 15000}
         return {
             "t": "enemies",
             "updatedAt": self.last_enemy_at or now,
@@ -303,6 +304,7 @@ class SectorRoom:
             "host": "SERVER",
             "serverEnemies": True,
             "serverDebris": True,
+            "serverLoot": True,
             "areaIndex": self.area_index,
             "enemies": self.enemies,
             "kills": self.kills,
@@ -554,13 +556,17 @@ class SectorRoom:
     # ── debris / rocks ───────────────────────────────────────
 
     def ensure_debris(self) -> None:
-        if self._debris_spawned and (self.debris_ents or self.loot_ents or is_boss_zone(self.area_index)):
+        if not self._debris_spawned:
+            self._debris_spawned = True
+            self.seed_debris()
+            self.seed_rocks()
+            self.seed_loot()
+            self.rebuild_debris_snap()
             return
-        self._debris_spawned = True
-        self.seed_debris()
-        self.seed_rocks()
-        self.seed_loot()
-        self.rebuild_debris_snap()
+        # Long-lived rooms / older deploys: always keep supply crates populated.
+        if not self.loot_ents:
+            self.seed_loot()
+            self.rebuild_debris_snap()
 
     def seed_debris(self) -> None:
         need = debris_count_for_area(self.area_index)
@@ -696,7 +702,7 @@ class SectorRoom:
     def debris_payload(self) -> dict:
         now = time.time() * 1000
         self.debris_kills = {k: v for k, v in self.debris_kills.items() if now - float(v) < 3000}
-        self.loot_kills = {k: v for k, v in self.loot_kills.items() if now - float(v) < 3000}
+        self.loot_kills = {k: v for k, v in self.loot_kills.items() if now - float(v) < 15000}
         return {
             "t": "debris",
             "updatedAt": self.last_debris_at or now,
@@ -879,7 +885,7 @@ class SectorRoom:
             if was_boss:
                 self.last_boss_kill = time.time()
             elif not is_boss_zone(self.area_index):
-                self.respawn_queue.append((time.time() + 5.0, ex, ey))
+                self.respawn_queue.append((time.time() + 8.0, ex, ey))
             # Ore drops from kills (server-owned)
             self.spawn_enemy_ore(ex, ey, random.randint(1, 3))
             self.broadcast_debris()
@@ -1027,6 +1033,7 @@ class SectorRoom:
                 "youAreHost": client.is_host,
                 "serverEnemies": True,
                 "serverDebris": True,
+                "serverLoot": True,
                 "players": self.snapshot_players(),
             }
         )
