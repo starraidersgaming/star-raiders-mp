@@ -670,6 +670,10 @@ class SectorRoom:
         return max(1, min(12, n))
 
     def serialize_debris(self, d: dict) -> dict:
+        # Keep fractional HP — int() truncation made 0.1..0.9 publish as 0 and
+        # clients treated still-living asteroids as dead (explode loop while mining).
+        h = max(0.0, float(d.get("h") or 0))
+        m = max(0.0, float(d.get("m") or 0))
         return {
             "x": round(float(d["x"]), 1),
             "y": round(float(d["y"]), 1),
@@ -679,8 +683,8 @@ class SectorRoom:
             "rs": round(float(d.get("rs") or 0), 3),
             "sc": round(float(d.get("sc") or 1), 2),
             "id": d.get("asset") or "asteroid_1",
-            "h": int(max(0, d.get("h") or 0)),
-            "m": int(max(0, d.get("m") or 0)),
+            "h": round(h, 2),
+            "m": round(m, 2) if m > 0 else int(ASTEROID_MAX_HP),
             "mn": 1 if d.get("mn") else 0,
         }
 
@@ -737,8 +741,8 @@ class SectorRoom:
     def rebuild_debris_snap(self) -> None:
         self.debris = {}
         for sid, d in self.debris_ents.items():
-            # Never publish dead asteroids — clients that recreate+destroy them loop explosions.
-            if d.get("mn") and float(d.get("h") or 0) <= 0:
+            # Never publish dead/dying-truncated asteroids — clients used to boom-loop on h==0 rows.
+            if d.get("mn") and float(d.get("h") or 0) <= 0.001:
                 continue
             self.debris[sid] = self.serialize_debris(d)
         self.rocks = {sid: self.serialize_rock(r) for sid, r in self.rock_ents.items()}
@@ -986,7 +990,8 @@ class SectorRoom:
         if kill:
             d["h"] = 0
             self.destroy_asteroid(sync_id, d)
-        hp_left = 0 if kill else int(d["h"])
+        # Fractional HP while alive — never send 0 unless kill (int trunc caused fake deaths).
+        hp_left = 0 if kill else round(float(d["h"]), 2)
         self.broadcast(
             {
                 "t": "hit",
@@ -1002,7 +1007,9 @@ class SectorRoom:
             },
             None,
         )
-        self.broadcast_debris()
+        # Full debris snap on kill only — mining ticks use hit HP; 8 Hz tick covers motion.
+        if kill:
+            self.broadcast_debris()
 
     def apply_rock_collect(self, nick: str, sync_id: str, msg: dict) -> None:
         self.ensure_debris()
