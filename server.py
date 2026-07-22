@@ -1143,6 +1143,22 @@ class SectorRoom:
             s["palY"] = float(py)
         if isinstance(pa, (int, float)):
             s["palAngle"] = float(pa)
+        # Mining laser target (asteroid syncId + pose fallback)
+        mid = msg.get("mineId", msg.get("mid"))
+        if mid is None or mid == "" or mid is False:
+            s["mineId"] = None
+            s["mineX"] = None
+            s["mineY"] = None
+        else:
+            s["mineId"] = str(mid)[:48]
+            mx = msg.get("mineX", msg.get("mx"))
+            my = msg.get("mineY", msg.get("my"))
+            if isinstance(mx, (int, float)) and isinstance(my, (int, float)):
+                s["mineX"] = float(mx)
+                s["mineY"] = float(my)
+            else:
+                s["mineX"] = None
+                s["mineY"] = None
         s["lastActive"] = time.time() * 1000
         out = {
             "t": "state",
@@ -1166,7 +1182,14 @@ class SectorRoom:
             "killPoints": s.get("killPoints", 0),
             "activeTitle": s.get("activeTitle"),
             "palLevel": int(s.get("palLevel") or 0),
+            "mineId": s.get("mineId"),
+            "mid": s.get("mineId"),
         }
+        if isinstance(s.get("mineX"), (int, float)) and isinstance(s.get("mineY"), (int, float)):
+            out["mineX"] = float(s["mineX"])
+            out["mineY"] = float(s["mineY"])
+            out["mx"] = out["mineX"]
+            out["my"] = out["mineY"]
         if isinstance(s.get("palX"), (int, float)) and isinstance(s.get("palY"), (int, float)):
             out["palX"] = float(s["palX"])
             out["palY"] = float(s["palY"])
