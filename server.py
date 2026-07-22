@@ -3,7 +3,7 @@
 Star Raiders — realtime sector sync server (Python 3.10+, stdlib only)
 
 Rooms are per areaIndex.
-SERVER-OWNED: enemies (incl. bosses/minions), asteroids/debris, ore rocks.
+SERVER-OWNED: enemies (incl. bosses/minions), asteroids/debris, ore rocks, loot boxes.
 Clients mirror snapshots and send hit / rockCollect intents.
 Env: PORT=8787  ENEMY_HZ=20
 
@@ -196,17 +196,23 @@ class SectorRoom:
         self.last_enemy_at = 0.0
         self.last_enemy_seq = 0
         self.next_enemy_id = 1
-        self.respawn_queue: List[float] = []
+        # (ready_at, avoid_x, avoid_y)
+        self.respawn_queue: List[Tuple[float, float, float]] = []
+        self.recent_deaths: List[Tuple[float, float, float]] = []
         self.last_boss_kill = 0.0
         self.debris_ents: Dict[str, dict] = {}
         self.rock_ents: Dict[str, dict] = {}
+        self.loot_ents: Dict[str, dict] = {}
         self.debris: Dict[str, dict] = {}
         self.rocks: Dict[str, dict] = {}
+        self.loot: Dict[str, dict] = {}
         self.debris_kills: Dict[str, float] = {}
+        self.loot_kills: Dict[str, float] = {}
         self.last_debris_at = 0.0
         self.last_debris_seq = 0
         self.next_debris_id = 1
         self.next_rock_id = 1
+        self.next_loot_id = 1
         self._spawned = False
         self._debris_spawned = False
         self.pending_collect: Dict[str, float] = {}
@@ -315,7 +321,8 @@ class SectorRoom:
             self.ensure_boss()
             self._spawned = True
             return
-        if self._spawned and self.enemy_ents:
+        # Seed once only — refills use delayed respawn queue (no same-spot instant reset).
+        if self._spawned:
             return
         self._spawned = True
         self.seed_enemies()
@@ -370,16 +377,35 @@ class SectorRoom:
         }
         return sid
 
-    def spawn_one(self) -> None:
+    def _spawn_point_ok(self, x: float, y: float, avoid_x: Optional[float], avoid_y: Optional[float]) -> bool:
+        if self.area_index == 0 and math.hypot(x - WORLD / 2, y - WORLD / 2) < 700:
+            return False
+        if avoid_x is not None and avoid_y is not None and math.hypot(x - avoid_x, y - avoid_y) < 900:
+            return False
+        now = time.time()
+        self.recent_deaths = [d for d in self.recent_deaths if d[2] > now]
+        for dx, dy, _u in self.recent_deaths:
+            if math.hypot(x - dx, y - dy) < 750:
+                return False
+        for c in self.clients.values():
+            s = c.state
+            if math.hypot(x - float(s.get("x") or 0), y - float(s.get("y") or 0)) < 550:
+                return False
+        for e in self.enemy_ents.values():
+            if math.hypot(x - float(e["x"]), y - float(e["y"])) < 220:
+                return False
+        return True
+
+    def spawn_one(self, avoid_x: Optional[float] = None, avoid_y: Optional[float] = None) -> None:
         typ = type_for_area(self.area_index)
         x = random.uniform(200, WORLD - 200)
         y = random.uniform(200, WORLD - 200)
-        if self.area_index == 0:
-            for _ in range(8):
-                if math.hypot(x - WORLD / 2, y - WORLD / 2) > 700:
-                    break
-                x = random.uniform(200, WORLD - 200)
-                y = random.uniform(200, WORLD - 200)
+        for _ in range(28):
+            cx = random.uniform(200, WORLD - 200)
+            cy = random.uniform(200, WORLD - 200)
+            if self._spawn_point_ok(cx, cy, avoid_x, avoid_y):
+                x, y = cx, cy
+                break
         self.spawn_typed(typ, x, y)
 
     def spawn_minion(self, boss: dict) -> None:
@@ -500,15 +526,24 @@ class SectorRoom:
         for sid in dead_ids:
             self.enemy_ents.pop(sid, None)
 
-        # Delayed respawns (normal sectors only)
+        # Delayed respawns (normal sectors only) — away from death spot
         if not is_boss_zone(self.area_index):
             cap = enemy_cap(self.area_index)
-            self.respawn_queue.sort()
-            while self.respawn_queue and self.respawn_queue[0] <= now and len(self.enemy_ents) < cap:
+            self.respawn_queue.sort(key=lambda item: item[0] if isinstance(item, (list, tuple)) else item)
+            while self.respawn_queue and len(self.enemy_ents) < cap:
+                item = self.respawn_queue[0]
+                ready = item[0] if isinstance(item, (list, tuple)) else item
+                if ready > now:
+                    break
                 self.respawn_queue.pop(0)
-                self.spawn_one()
+                ax = item[1] if isinstance(item, (list, tuple)) and len(item) > 1 else None
+                ay = item[2] if isinstance(item, (list, tuple)) and len(item) > 2 else None
+                self.spawn_one(ax, ay)
             if len(self.enemy_ents) >= cap:
-                self.respawn_queue = [t for t in self.respawn_queue if t > now]
+                self.respawn_queue = [
+                    item for item in self.respawn_queue
+                    if (item[0] if isinstance(item, (list, tuple)) else item) > now
+                ]
         else:
             self.ensure_boss()
 
@@ -519,11 +554,12 @@ class SectorRoom:
     # ── debris / rocks ───────────────────────────────────────
 
     def ensure_debris(self) -> None:
-        if self._debris_spawned and (self.debris_ents or is_boss_zone(self.area_index)):
+        if self._debris_spawned and (self.debris_ents or self.loot_ents or is_boss_zone(self.area_index)):
             return
         self._debris_spawned = True
         self.seed_debris()
         self.seed_rocks()
+        self.seed_loot()
         self.rebuild_debris_snap()
 
     def seed_debris(self) -> None:
@@ -616,25 +652,64 @@ class SectorRoom:
             "v": int(r.get("v") or 2),
         }
 
+    def seed_loot(self) -> None:
+        # Match client setupLootBoxes: always 12 supply crates per sector.
+        for _ in range(12):
+            sid = f"l{self.area_index}_S_{self.next_loot_id}"
+            self.next_loot_id += 1
+            ang = (random.random() - 0.5) * 0.4
+            self.loot_ents[sid] = {
+                "id": sid,
+                "x": random.uniform(0, WORLD),
+                "y": random.uniform(0, WORLD),
+                "vx": (random.random() - 0.5) * 2.5,
+                "vy": (random.random() - 0.5) * 2.5,
+                "a": ang,
+                "ba": ang,
+                "rs": 0.6 + random.random() * 0.5,
+                "sc": 1.05 + random.random() * 0.25,
+                "pu": random.random() * math.pi * 2,
+                "r": 16,
+            }
+
+    def serialize_loot(self, b: dict) -> dict:
+        return {
+            "x": round(float(b["x"]), 1),
+            "y": round(float(b["y"]), 1),
+            "vx": round(float(b.get("vx") or 0), 2),
+            "vy": round(float(b.get("vy") or 0), 2),
+            "a": round(float(b.get("a") or 0), 2),
+            "ba": round(float(b.get("ba") or 0), 2),
+            "rs": round(float(b.get("rs") or 0), 3),
+            "sc": round(float(b.get("sc") or 1), 2),
+            "pu": round(float(b.get("pu") or 0), 2),
+            "r": int(b.get("r") or 16),
+        }
+
     def rebuild_debris_snap(self) -> None:
         self.debris = {sid: self.serialize_debris(d) for sid, d in self.debris_ents.items()}
         self.rocks = {sid: self.serialize_rock(r) for sid, r in self.rock_ents.items()}
+        self.loot = {sid: self.serialize_loot(b) for sid, b in self.loot_ents.items()}
         self.last_debris_seq += 1
         self.last_debris_at = time.time() * 1000
 
     def debris_payload(self) -> dict:
         now = time.time() * 1000
         self.debris_kills = {k: v for k, v in self.debris_kills.items() if now - float(v) < 3000}
+        self.loot_kills = {k: v for k, v in self.loot_kills.items() if now - float(v) < 3000}
         return {
             "t": "debris",
             "updatedAt": self.last_debris_at or now,
             "seq": self.last_debris_seq or None,
             "host": "SERVER",
             "serverDebris": True,
+            "serverLoot": True,
             "areaIndex": self.area_index,
             "debris": self.debris,
             "kills": self.debris_kills,
             "rocks": self.rocks,
+            "loot": self.loot,
+            "lootKills": self.loot_kills,
             "full": 1,
         }
 
@@ -672,9 +747,69 @@ class SectorRoom:
                 r["y"] += WORLD + 200
             elif r["y"] > WORLD + 100:
                 r["y"] -= WORLD + 200
+        for b in self.loot_ents.values():
+            b["x"] = float(b["x"]) + float(b.get("vx") or 0) * dt
+            b["y"] = float(b["y"]) + float(b.get("vy") or 0) * dt
+            b["pu"] = float(b.get("pu") or 0) + float(b.get("rs") or 0.8) * dt
+            b["a"] = float(b.get("ba") or 0) + math.sin(float(b["pu"])) * 0.28
+            if b["x"] < -40:
+                b["x"] += WORLD + 80
+            elif b["x"] > WORLD + 40:
+                b["x"] -= WORLD + 80
+            if b["y"] < -40:
+                b["y"] += WORLD + 80
+            elif b["y"] > WORLD + 40:
+                b["y"] -= WORLD + 80
         # prune stale collect locks
         now = time.time()
         self.pending_collect = {k: t for k, t in self.pending_collect.items() if now - t < 2.0}
+        self.broadcast_debris()
+
+    def roll_loot_reward(self) -> dict:
+        roll = random.random()
+        if roll < 0.45:
+            amt = random.randint(250, 1000)
+            return {"type": "credits", "amt": amt, "label": f"+{amt} CR", "color": "#fbbf24"}
+        if roll < 0.73:
+            amt = random.randint(25, 50)
+            return {"type": "ammo_x2", "amt": amt, "label": f"+{amt} x2 AMMO", "color": "#67e8f9"}
+        if roll < 0.89:
+            amt = random.randint(1, 1000)
+            return {"type": "xp", "amt": amt, "label": f"+{amt} XP", "color": "#86efac"}
+        if roll < 0.97:
+            amt = random.randint(25, 50)
+            return {"type": "ammo_x3", "amt": amt, "label": f"+{amt} x3 AMMO", "color": "#c084fc"}
+        amt = random.randint(1, 5)
+        return {"type": "merits", "amt": amt, "label": f"+{amt} MR", "color": "#fde68a"}
+
+    def apply_loot_collect(self, nick: str, sync_id: str, msg: dict) -> None:
+        self.ensure_debris()
+        now = time.time()
+        if sync_id in self.pending_collect and now - self.pending_collect[sync_id] < 1.2:
+            return
+        box = self.loot_ents.get(sync_id)
+        if not box:
+            return
+        self.pending_collect[sync_id] = now
+        self.loot_ents.pop(sync_id, None)
+        self.loot_kills[sync_id] = now * 1000
+        reward = self.roll_loot_reward()
+        self.broadcast(
+            {
+                "t": "hit",
+                "by": nick,
+                "syncId": sync_id,
+                "hp": 0,
+                "dmg": 0,
+                "kill": True,
+                "kind": "lootCollect",
+                "x": box.get("x", msg.get("x")),
+                "y": box.get("y", msg.get("y")),
+                "reward": reward,
+                "ts": int(now * 1000),
+            },
+            None,
+        )
         self.broadcast_debris()
 
     def destroy_asteroid(self, sid: str, d: dict) -> None:
@@ -709,6 +844,10 @@ class SectorRoom:
         kind = msg.get("kind")
         dmg = clamp_dmg(float(msg.get("dmg") or 0))
 
+        if kind == "lootCollect" or sync_id.startswith("l"):
+            self.apply_loot_collect(nick, sync_id, msg)
+            return
+
         if kind == "rockCollect" or sync_id.startswith("r"):
             self.apply_rock_collect(nick, sync_id, msg)
             return
@@ -736,10 +875,11 @@ class SectorRoom:
             was_boss = int(e.get("t") or 0) == 14
             self.kills[sync_id] = time.time() * 1000
             self.enemy_ents.pop(sync_id, None)
+            self.recent_deaths.append((ex, ey, time.time() + 12.0))
             if was_boss:
                 self.last_boss_kill = time.time()
             elif not is_boss_zone(self.area_index):
-                self.respawn_queue.append(time.time() + 5.0)
+                self.respawn_queue.append((time.time() + 5.0, ex, ey))
             # Ore drops from kills (server-owned)
             self.spawn_enemy_ore(ex, ey, random.randint(1, 3))
             self.broadcast_debris()
@@ -856,6 +996,10 @@ class SectorRoom:
             "shield": int(msg.get("shield") or 0),
             "maxShield": int(msg.get("maxShield") or 0),
             "drones": int(msg.get("drones") or 0),
+            "palLevel": int(msg.get("palLevel") or msg.get("pl") or 0),
+            "palX": msg.get("palX") if msg.get("palX") is not None else msg.get("px"),
+            "palY": msg.get("palY") if msg.get("palY") is not None else msg.get("py"),
+            "palAngle": msg.get("palAngle") if msg.get("palAngle") is not None else msg.get("pa"),
             "inHangar": bool(msg.get("inHangar")),
             "level": int(msg.get("level") or 0),
             "hasBetaBadge": bool(msg.get("hasBetaBadge")),
@@ -927,32 +1071,70 @@ class SectorRoom:
         if "activeTitle" in msg:
             title = str(msg.get("activeTitle") or "").strip()[:48]
             s["activeTitle"] = title or None
+        if "clanTag" in msg:
+            tag = str(msg.get("clanTag") or "").strip()[:8]
+            s["clanTag"] = tag or None
+        dl = msg.get("droneLevels", msg.get("dl"))
+        if isinstance(dl, list):
+            s["droneLevels"] = [max(1, min(3, int(x) if x is not None else 1)) for x in dl[:16]]
+        # P.A.L. pose (accept long or compact keys)
+        pl = msg.get("palLevel", msg.get("pl"))
+        if pl is not None:
+            try:
+                s["palLevel"] = max(0, min(4, int(pl)))
+            except (TypeError, ValueError):
+                pass
+            if int(s.get("palLevel") or 0) <= 0:
+                s["palX"] = None
+                s["palY"] = None
+                s["palAngle"] = None
+        px = msg.get("palX", msg.get("px"))
+        py = msg.get("palY", msg.get("py"))
+        pa = msg.get("palAngle", msg.get("pa"))
+        if isinstance(px, (int, float)) and isinstance(py, (int, float)):
+            s["palX"] = float(px)
+            s["palY"] = float(py)
+        if isinstance(pa, (int, float)):
+            s["palAngle"] = float(pa)
         s["lastActive"] = time.time() * 1000
-        self.broadcast(
-            {
-                "t": "state",
-                "nick": nick,
-                "x": s["x"],
-                "y": s["y"],
-                "vx": s["vx"],
-                "vy": s["vy"],
-                "angle": s["angle"],
-                "shipIndex": s["shipIndex"],
-                "hp": s["hp"],
-                "maxHp": s["maxHp"],
-                "shield": s["shield"],
-                "maxShield": s["maxShield"],
-                "drones": s["drones"],
-                "inHangar": s["inHangar"],
-                "isGM": s.get("isGM", False),
-                "isMod": s.get("isMod", False),
-                "hasBetaBadge": s.get("hasBetaBadge", False),
-                "isRankOne": s.get("isRankOne", False),
-                "killPoints": s.get("killPoints", 0),
-                "activeTitle": s.get("activeTitle"),
-            },
-            nick,
-        )
+        out = {
+            "t": "state",
+            "nick": nick,
+            "x": s["x"],
+            "y": s["y"],
+            "vx": s["vx"],
+            "vy": s["vy"],
+            "angle": s["angle"],
+            "shipIndex": s["shipIndex"],
+            "hp": s["hp"],
+            "maxHp": s["maxHp"],
+            "shield": s["shield"],
+            "maxShield": s["maxShield"],
+            "drones": s["drones"],
+            "inHangar": s["inHangar"],
+            "isGM": s.get("isGM", False),
+            "isMod": s.get("isMod", False),
+            "hasBetaBadge": s.get("hasBetaBadge", False),
+            "isRankOne": s.get("isRankOne", False),
+            "killPoints": s.get("killPoints", 0),
+            "activeTitle": s.get("activeTitle"),
+            "palLevel": int(s.get("palLevel") or 0),
+        }
+        if isinstance(s.get("palX"), (int, float)) and isinstance(s.get("palY"), (int, float)):
+            out["palX"] = float(s["palX"])
+            out["palY"] = float(s["palY"])
+            out["px"] = out["palX"]
+            out["py"] = out["palY"]
+        if isinstance(s.get("palAngle"), (int, float)):
+            out["palAngle"] = float(s["palAngle"])
+            out["pa"] = out["palAngle"]
+        out["pl"] = out["palLevel"]
+        if s.get("clanTag"):
+            out["clanTag"] = s["clanTag"]
+        if isinstance(s.get("droneLevels"), list):
+            out["droneLevels"] = s["droneLevels"]
+            out["dl"] = s["droneLevels"]
+        self.broadcast(out, nick)
 
     def on_shot(self, nick: str, msg: dict) -> None:
         self.broadcast(
@@ -1152,6 +1334,7 @@ def handle_http(sock: socket.socket, req: bytes) -> None:
             enemies = sum(len(r.enemy_ents) for r in rooms.values())
             debris = sum(len(r.debris_ents) for r in rooms.values())
             rocks = sum(len(r.rock_ents) for r in rooms.values())
+            loot = sum(len(r.loot_ents) for r in rooms.values())
             body = json.dumps(
                 {
                     "ok": True,
@@ -1160,8 +1343,10 @@ def handle_http(sock: socket.socket, req: bytes) -> None:
                     "enemies": enemies,
                     "debris": debris,
                     "rocks": rocks,
+                    "loot": loot,
                     "serverEnemies": True,
                     "serverDebris": True,
+                    "serverLoot": True,
                 }
             )
         resp = (
