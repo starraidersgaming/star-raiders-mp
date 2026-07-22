@@ -207,6 +207,9 @@ class SectorRoom:
         self.enemies: Dict[str, dict] = {}
         self.enemy_shots: list = []
         self.kills: Dict[str, float] = {}
+        # sid -> (serialized corpse with h=0, expire_at). Older mobile clients need
+        # an explicit hp=0 row in the enemies map to drop the sprite.
+        self.kill_corpses: Dict[str, Tuple[dict, float]] = {}
         self.last_enemy_at = 0.0
         self.last_enemy_seq = 0
         self.next_enemy_id = 1
@@ -233,24 +236,23 @@ class SectorRoom:
         self.pending_collect: Dict[str, float] = {}
 
     def pick_host(self) -> None:
-        # Legacy sticky host for old clients only — world is server-owned.
-        if self.host and self.host in self.clients:
-            for c in self.clients.values():
-                c.is_host = c.nick == self.host
-            return
-        nicks = sorted(self.clients.keys())
-        self.host = nicks[0] if nicks else None
+        # NEVER hand world authority to a phone/PC. Sticky-host on mobile was
+        # keeping a local enemy sim so kills worked on desktop but not on device.
+        self.host = "SERVER"
         for c in self.clients.values():
-            c.is_host = c.nick == self.host
-            c.send(self._host_msg(c))
+            was = c.is_host
+            c.is_host = False
+            if was:
+                c.send(self._host_msg(c))
 
     def _host_msg(self, c: Client) -> dict:
         return {
             "t": "host",
-            "host": self.host,
-            "youAreHost": c.is_host,
+            "host": "SERVER",
+            "youAreHost": False,
             "serverEnemies": True,
             "serverDebris": True,
+            "serverLoot": True,
         }
 
     def broadcast(self, msg: Any, except_nick: Optional[str] = None) -> None:
@@ -304,6 +306,14 @@ class SectorRoom:
             if e.get("h", 0) <= 0:
                 continue
             snap[sid] = self.serialize_enemy(e)
+        now = time.time()
+        self.kill_corpses = {
+            sid: pair for sid, pair in self.kill_corpses.items() if pair[1] > now
+        }
+        # Inject hp=0 corpses so older clients that ignore `kills` still drop sprites.
+        for sid, (corpse, _) in self.kill_corpses.items():
+            if sid not in snap:
+                snap[sid] = corpse
         self.enemies = snap
         self.last_enemy_seq += 1
         self.last_enemy_at = time.time() * 1000
@@ -317,6 +327,7 @@ class SectorRoom:
             "updatedAt": self.last_enemy_at or now,
             "seq": self.last_enemy_seq or None,
             "host": "SERVER",
+            "youAreHost": False,
             "serverEnemies": True,
             "serverDebris": True,
             "serverLoot": True,
@@ -903,6 +914,10 @@ class SectorRoom:
         if kill:
             was_boss = int(e.get("t") or 0) == 14
             self.kills[sync_id] = time.time() * 1000
+            corpse = self.serialize_enemy(e)
+            corpse["h"] = 0
+            corpse["g"] = 0
+            self.kill_corpses[sync_id] = (corpse, time.time() + 20.0)
             self.enemy_ents.pop(sync_id, None)
             self.recent_deaths.append((ex, ey, time.time() + 12.0))
             if was_boss:
@@ -920,14 +935,19 @@ class SectorRoom:
                 "hp": hp_left,
                 "dmg": dmg,
                 "kill": kill,
-                "kind": kind,
+                "dead": kill,
+                "remove": kill,
+                "kind": kind or "enemy",
                 "x": ex,
                 "y": ey,
                 "ts": int(time.time() * 1000),
             },
             None,
         )
+        # Two snaps: first drops the living row; second refreshes corpses/kills for mobile.
         self.broadcast_enemies()
+        if kill:
+            self.broadcast_enemies()
 
     def apply_debris_hit(self, nick: str, sync_id: str, msg: dict, dmg: float) -> None:
         self.ensure_debris()
@@ -1040,10 +1060,8 @@ class SectorRoom:
             "lastActive": time.time() * 1000,
         }
         self.clients[nick] = client
-        if not self.host or self.host not in self.clients:
-            self.pick_host()
-        else:
-            client.is_host = client.nick == self.host
+        client.is_host = False
+        self.pick_host()
         self.ensure_enemies()
         self.ensure_debris()
         self.rebuild_enemy_snap()
@@ -1052,8 +1070,8 @@ class SectorRoom:
             {
                 "t": "welcome",
                 "areaIndex": self.area_index,
-                "host": self.host,
-                "youAreHost": client.is_host,
+                "host": "SERVER",
+                "youAreHost": False,
                 "serverEnemies": True,
                 "serverDebris": True,
                 "serverLoot": True,
@@ -1073,9 +1091,8 @@ class SectorRoom:
         if not self.clients:
             rooms.pop(self.area_index, None)
             return
-        if self.host == nick:
-            # World persists — only reassign legacy host flag.
-            self.pick_host()
+        # World always stays on SERVER — refresh host flags for remaining clients.
+        self.pick_host()
 
     def on_state(self, nick: str, msg: dict) -> None:
         c = self.clients.get(nick)
@@ -1317,9 +1334,11 @@ def tick_loop() -> None:
                             {
                                 "t": "players",
                                 "players": room.snapshot_players(),
-                                "host": room.host,
+                                "host": "SERVER",
+                                "youAreHost": False,
                                 "serverEnemies": True,
                                 "serverDebris": True,
+                                "serverLoot": True,
                             }
                         )
 
