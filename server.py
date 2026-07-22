@@ -37,6 +37,20 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HIT_DMG = 25000.0
 MAX_HITS_PER_SEC = 28
 ASTEROID_MAX_HP = 200.0
+# Bump to force reseed of supply crates to the shared deterministic layout.
+LOOT_LAYOUT_VER = 1
+
+
+def area_loot_rnd(area_index: int):
+    """Same LCG as client setupLootBoxes / setupStars-style seeding."""
+    seed = ((((int(area_index) + 1) * 2654435761) ^ 0xC0A7E001) & 0xFFFFFFFF)
+
+    def rnd() -> float:
+        nonlocal seed
+        seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+        return seed / 4294967296.0
+
+    return rnd
 
 # Full client ft[] parity (radius = size/2). Boss=14, minion=15.
 ENEMY_TYPES = [
@@ -213,6 +227,7 @@ class SectorRoom:
         self.next_debris_id = 1
         self.next_rock_id = 1
         self.next_loot_id = 1
+        self._loot_layout_ver = 0
         self._spawned = False
         self._debris_spawned = False
         self.pending_collect: Dict[str, float] = {}
@@ -563,7 +578,12 @@ class SectorRoom:
             self.seed_loot()
             self.rebuild_debris_snap()
             return
-        # Long-lived rooms / older deploys: always keep supply crates populated.
+        # Redeploy: switch rooms onto the shared deterministic crate layout.
+        if self._loot_layout_ver < LOOT_LAYOUT_VER:
+            self.seed_loot()
+            self.rebuild_debris_snap()
+            return
+        # Long-lived rooms: refill crates if the sector was emptied.
         if not self.loot_ents:
             self.seed_loot()
             self.rebuild_debris_snap()
@@ -659,22 +679,25 @@ class SectorRoom:
         }
 
     def seed_loot(self) -> None:
-        # Match client setupLootBoxes: always 12 supply crates per sector.
-        for _ in range(12):
-            sid = f"l{self.area_index}_S_{self.next_loot_id}"
-            self.next_loot_id += 1
-            ang = (random.random() - 0.5) * 0.4
+        # Deterministic 12 crates per area — identical on every client even before snaps.
+        rnd = area_loot_rnd(self.area_index)
+        self.loot_ents.clear()
+        self.next_loot_id = 13
+        self._loot_layout_ver = LOOT_LAYOUT_VER
+        for i in range(1, 13):
+            sid = f"l{self.area_index}_S_{i}"
+            ang = (rnd() - 0.5) * 0.4
             self.loot_ents[sid] = {
                 "id": sid,
-                "x": random.uniform(0, WORLD),
-                "y": random.uniform(0, WORLD),
-                "vx": (random.random() - 0.5) * 2.5,
-                "vy": (random.random() - 0.5) * 2.5,
+                "x": rnd() * WORLD,
+                "y": rnd() * WORLD,
+                "vx": (rnd() - 0.5) * 2.5,
+                "vy": (rnd() - 0.5) * 2.5,
                 "a": ang,
                 "ba": ang,
-                "rs": 0.6 + random.random() * 0.5,
-                "sc": 1.05 + random.random() * 0.25,
-                "pu": random.random() * math.pi * 2,
+                "rs": 0.6 + rnd() * 0.5,
+                "sc": 1.05 + rnd() * 0.25,
+                "pu": rnd() * math.pi * 2,
                 "r": 16,
             }
 
