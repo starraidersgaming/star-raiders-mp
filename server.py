@@ -35,7 +35,8 @@ PLAYERS_DT = 1.0 / PLAYERS_HZ
 WORLD = 6000.0
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HIT_DMG = 25000.0
-MAX_HITS_PER_SEC = 28
+# Mining ticks (~12.5 Hz) + combat share one bucket; 28 dropped mine ticks mid-stream.
+MAX_HITS_PER_SEC = 48
 ASTEROID_MAX_HP = 200.0
 # Bump to force reseed of supply crates to the shared deterministic layout.
 LOOT_LAYOUT_VER = 1
@@ -201,6 +202,8 @@ class Client:
 class SectorRoom:
     def __init__(self, area_index: int):
         self.area_index = area_index
+        # Unique per room instance so clients drop seq watermarks after empty-room recycle.
+        self.room_epoch = int(time.time() * 1000) ^ ((int(area_index) + 1) * 10007)
         self.clients: Dict[str, Client] = {}
         self.host: Optional[str] = None  # legacy UI only
         self.enemy_ents: Dict[str, dict] = {}
@@ -326,6 +329,7 @@ class SectorRoom:
             "t": "enemies",
             "updatedAt": self.last_enemy_at or now,
             "seq": self.last_enemy_seq or None,
+            "roomEpoch": self.room_epoch,
             "host": "SERVER",
             "youAreHost": False,
             "serverEnemies": True,
@@ -538,12 +542,16 @@ class SectorRoom:
                         {
                             "id": f"{self.area_index}:SERVER:{int(now*1000)}:{self._shot_seq}",
                             "areaIndex": self.area_index,
+                            "sourceEnemyId": sid,
+                            "targetNick": pilot[0],
                             "x": float(e["x"]),
                             "y": float(e["y"]),
                             "vx": math.cos(aim) * spd,
                             "vy": math.sin(aim) * spd,
                             "a": aim,
+                            "angle": aim,
                             "damage": int(e["d"]),
+                            "willMiss": 0,
                             "assetId": "laser_enemy",
                             "createdAt": now * 1000,
                         }
@@ -727,7 +735,12 @@ class SectorRoom:
         }
 
     def rebuild_debris_snap(self) -> None:
-        self.debris = {sid: self.serialize_debris(d) for sid, d in self.debris_ents.items()}
+        self.debris = {}
+        for sid, d in self.debris_ents.items():
+            # Never publish dead asteroids — clients that recreate+destroy them loop explosions.
+            if d.get("mn") and float(d.get("h") or 0) <= 0:
+                continue
+            self.debris[sid] = self.serialize_debris(d)
         self.rocks = {sid: self.serialize_rock(r) for sid, r in self.rock_ents.items()}
         self.loot = {sid: self.serialize_loot(b) for sid, b in self.loot_ents.items()}
         self.last_debris_seq += 1
@@ -735,12 +748,13 @@ class SectorRoom:
 
     def debris_payload(self) -> dict:
         now = time.time() * 1000
-        self.debris_kills = {k: v for k, v in self.debris_kills.items() if now - float(v) < 3000}
+        self.debris_kills = {k: v for k, v in self.debris_kills.items() if now - float(v) < 15000}
         self.loot_kills = {k: v for k, v in self.loot_kills.items() if now - float(v) < 15000}
         return {
             "t": "debris",
             "updatedAt": self.last_debris_at or now,
             "seq": self.last_debris_seq or None,
+            "roomEpoch": self.room_epoch,
             "host": "SERVER",
             "serverDebris": True,
             "serverLoot": True,
@@ -1010,6 +1024,8 @@ class SectorRoom:
             "kind": "rockCollect",
             "x": rock.get("x", msg.get("x")),
             "y": rock.get("y", msg.get("y")),
+            "typeId": rock.get("t") or rock.get("typeId") or "iron",
+            "value": int(rock.get("v") if rock.get("v") is not None else rock.get("value") or 2),
             "ts": int(time.time() * 1000),
         }
         if msg.get("label") is not None:
@@ -1070,6 +1086,7 @@ class SectorRoom:
             {
                 "t": "welcome",
                 "areaIndex": self.area_index,
+                "roomEpoch": self.room_epoch,
                 "host": "SERVER",
                 "youAreHost": False,
                 "serverEnemies": True,
