@@ -5,7 +5,7 @@ Star Raiders — realtime sector sync server (Python 3.10+, stdlib only)
 Rooms are per areaIndex.
 SERVER-OWNED: enemies (incl. bosses/minions), asteroids/debris, ore rocks, loot boxes.
 Clients mirror snapshots and send hit / rockCollect intents.
-Env: PORT=8787  ENEMY_HZ=20
+Env: PORT=8787  ENEMY_HZ=12  DEBRIS_HZ=5
 
   py -3 server.py
 """
@@ -25,9 +25,10 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 PORT = int(os.environ.get("PORT", "8787"))
-ENEMY_HZ = float(os.environ.get("ENEMY_HZ", "20"))
+# Slightly lower defaults cut full-snap bandwidth; clients dead-reckon between ticks.
+ENEMY_HZ = float(os.environ.get("ENEMY_HZ", "12"))
 ENEMY_DT = max(1.0 / 30.0, 1.0 / max(1.0, ENEMY_HZ))
-DEBRIS_HZ = float(os.environ.get("DEBRIS_HZ", "8"))
+DEBRIS_HZ = float(os.environ.get("DEBRIS_HZ", "5"))
 DEBRIS_DT = max(1.0 / 15.0, 1.0 / max(1.0, DEBRIS_HZ))
 PLAYERS_HZ = 4.0
 PLAYERS_DT = 1.0 / PLAYERS_HZ
@@ -237,6 +238,10 @@ class SectorRoom:
         self._spawned = False
         self._debris_spawned = False
         self.pending_collect: Dict[str, float] = {}
+        # Pre-encoded broadcasts flushed outside the global lock (avoids sendall stalls).
+        self._outbox: List[Tuple["Client", str]] = []
+        # nick -> last syncPlease wall time (rate-limit full snap replies)
+        self._sync_please_at: Dict[str, float] = {}
 
     def pick_host(self) -> None:
         # NEVER hand world authority to a phone/PC. Sticky-host on mobile was
@@ -263,7 +268,16 @@ class SectorRoom:
         for nick, c in list(self.clients.items()):
             if nick == except_nick:
                 continue
-            c.send(raw)
+            self._outbox.append((c, raw))
+
+    def flush_outbox(self) -> None:
+        box = self._outbox
+        if not box:
+            return
+        self._outbox = []
+        for c, raw in box:
+            if c and c.alive:
+                c.send(raw)
 
     def snapshot_players(self) -> dict:
         out = {}
@@ -325,6 +339,11 @@ class SectorRoom:
         now = time.time() * 1000
         # Keep kill tombstones long enough that late/stale snaps cannot resurrect foes.
         self.kills = {k: v for k, v in self.kills.items() if now - float(v) < 15000}
+        # Only recent bolts — clients already dedupe by shot id; resending 40 every tick was heavy.
+        shot_cut = now - 700.0
+        recent_shots = [
+            sh for sh in self.enemy_shots if float(sh.get("createdAt") or 0) >= shot_cut
+        ][-16:]
         return {
             "t": "enemies",
             "updatedAt": self.last_enemy_at or now,
@@ -338,7 +357,7 @@ class SectorRoom:
             "areaIndex": self.area_index,
             "enemies": self.enemies,
             "kills": self.kills,
-            "shots": self.enemy_shots[-40:],
+            "shots": recent_shots,
             "full": 1,
         }
 
@@ -533,8 +552,10 @@ class SectorRoom:
                 fr = max(0.35, float(e.get("fr") or 1.0))
                 if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
                     e["last_fire"] = now
+                    # Miss % only — clients home non-miss bolts so strafing cannot dodge.
+                    will_miss = random.random() < 0.18
                     aim = math.atan2(pilot[2] - e["y"], pilot[1] - e["x"])
-                    if random.random() < 0.18:
+                    if will_miss:
                         aim += (1 if random.random() < 0.5 else -1) * (0.22 + random.random() * 0.18)
                     spd = 400.0
                     self._shot_seq = getattr(self, "_shot_seq", 0) + 1
@@ -551,7 +572,7 @@ class SectorRoom:
                             "a": aim,
                             "angle": aim,
                             "damage": int(e["d"]),
-                            "willMiss": 0,
+                            "willMiss": 1 if will_miss else 0,
                             "assetId": "laser_enemy",
                             "createdAt": now * 1000,
                         }
@@ -868,7 +889,7 @@ class SectorRoom:
             },
             None,
         )
-        self.broadcast_debris()
+        # Hit event removes the crate on clients; next debris tick covers residual state.
 
     def destroy_asteroid(self, sid: str, d: dict) -> None:
         self.debris_ents.pop(sid, None)
@@ -944,7 +965,6 @@ class SectorRoom:
                 self.respawn_queue.append((time.time() + 8.0, ex, ey))
             # Ore drops from kills (server-owned)
             self.spawn_enemy_ore(ex, ey, random.randint(1, 3))
-            self.broadcast_debris()
         self.broadcast(
             {
                 "t": "hit",
@@ -962,10 +982,8 @@ class SectorRoom:
             },
             None,
         )
-        # Two snaps: first drops the living row; second refreshes corpses/kills for mobile.
+        # One enemy snap is enough (hit + corpse row). Ore appears on the next debris tick.
         self.broadcast_enemies()
-        if kill:
-            self.broadcast_enemies()
 
     def apply_debris_hit(self, nick: str, sync_id: str, msg: dict, dmg: float) -> None:
         self.ensure_debris()
@@ -1037,8 +1055,8 @@ class SectorRoom:
         }
         if msg.get("label") is not None:
             payload["label"] = msg.get("label")
+        # Hit event removes the rock on clients; next debris tick covers residual state.
         self.broadcast(payload, None)
-        self.broadcast_debris()
 
     # ── join / leave / relay ─────────────────────────────────
 
@@ -1111,6 +1129,7 @@ class SectorRoom:
         if nick not in self.clients:
             return
         self.clients.pop(nick, None)
+        self._sync_please_at.pop(nick, None)
         self.broadcast({"t": "leave", "nick": nick})
         if not self.clients:
             rooms.pop(self.area_index, None)
@@ -1275,44 +1294,72 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
     if not isinstance(msg, dict):
         return area
     t = msg.get("t")
+    flush_rooms: List[SectorRoom] = []
     with lock:
         if t == "join":
             if client.nick is not None and area is not None and area in rooms:
-                rooms[area].leave(client.nick)
+                old = rooms[area]
+                old.leave(client.nick)
+                flush_rooms.append(old)
             area = int(msg.get("areaIndex") or 0)
             room = get_room(area)
             room.join(client, msg)
-            return area
-
-        if client.nick is None or area is None:
-            return area
-        room = rooms.get(area)
-        if not room:
-            return area
-        nick = client.nick
-        if t == "state":
-            room.on_state(nick, msg)
-        elif t == "shot":
-            room.on_shot(nick, msg)
-        elif t == "hit":
-            room.apply_hit(nick, msg)
-        elif t == "enemies":
-            room.on_enemies(nick, msg)
-        elif t == "debris":
-            room.on_debris(nick, msg)
-        elif t == "syncPlease":
-            room.ensure_enemies()
-            room.ensure_debris()
-            room.rebuild_enemy_snap()
-            room.rebuild_debris_snap()
-            room.clients[nick].send(room.enemy_payload())
-            room.clients[nick].send(room.debris_payload())
-        elif t == "switch":
-            next_area = int(msg.get("areaIndex") or 0)
-            if next_area != area:
-                room.leave(nick)
-                area = next_area
-                get_room(area).join(client, {**msg, "nick": nick, "areaIndex": area})
+            flush_rooms.append(room)
+        elif client.nick is None or area is None:
+            pass
+        else:
+            room = rooms.get(area)
+            if room:
+                flush_rooms.append(room)
+                nick = client.nick
+                if t == "state":
+                    room.on_state(nick, msg)
+                elif t == "shot":
+                    room.on_shot(nick, msg)
+                elif t == "hit":
+                    room.apply_hit(nick, msg)
+                elif t == "enemies":
+                    room.on_enemies(nick, msg)
+                elif t == "debris":
+                    room.on_debris(nick, msg)
+                elif t == "syncPlease":
+                    # Rate-limit + queue via outbox. Rebuilding + sendall under the lock
+                    # starved tick_enemies when clients spammed syncPlease on roster ticks.
+                    now_sp = time.time()
+                    last_sp = float(room._sync_please_at.get(nick) or 0.0)
+                    if now_sp - last_sp >= 1.5:
+                        room._sync_please_at[nick] = now_sp
+                        room.ensure_enemies()
+                        room.ensure_debris()
+                        # Resend cached snaps — do not bump seq / rebuild unless empty.
+                        if not room.enemies:
+                            room.rebuild_enemy_snap()
+                        if not room.debris and not room.rocks and not room.loot:
+                            room.rebuild_debris_snap()
+                        c_sp = room.clients.get(nick)
+                        if c_sp:
+                            room._outbox.append(
+                                (c_sp, json.dumps(room.enemy_payload(), separators=(",", ":")))
+                            )
+                            room._outbox.append(
+                                (c_sp, json.dumps(room.debris_payload(), separators=(",", ":")))
+                            )
+                elif t == "switch":
+                    next_area = int(msg.get("areaIndex") or 0)
+                    if next_area != area:
+                        room.leave(nick)
+                        area = next_area
+                        nxt = get_room(area)
+                        nxt.join(client, {**msg, "nick": nick, "areaIndex": area})
+                        flush_rooms.append(nxt)
+    # Send queued snapshots outside the lock so other rooms/clients are not stalled.
+    seen = set()
+    for room in flush_rooms:
+        rid = id(room)
+        if rid in seen:
+            continue
+        seen.add(rid)
+        room.flush_outbox()
     return area
 
 
@@ -1345,9 +1392,13 @@ def client_thread(sock: socket.socket) -> None:
                     area = handle_message(client, area, payload)
                     conn_meta[sock] = (client, area)
     finally:
+        left_room = None
         with lock:
             if client.nick is not None and area is not None and area in rooms:
-                rooms[area].leave(client.nick)
+                left_room = rooms[area]
+                left_room.leave(client.nick)
+        if left_room:
+            left_room.flush_outbox()
         conn_meta.pop(sock, None)
         try:
             sock.close()
@@ -1362,17 +1413,20 @@ def tick_loop() -> None:
     while True:
         time.sleep(0.02)
         now = time.time()
+        flush_rooms: List[SectorRoom] = []
         with lock:
             if now - last_enemy >= ENEMY_DT:
                 last_enemy = now
                 for room in list(rooms.values()):
                     if room.clients:
                         room.tick_enemies(ENEMY_DT)
+                        flush_rooms.append(room)
             if now - last_debris >= DEBRIS_DT:
                 last_debris = now
                 for room in list(rooms.values()):
                     if room.clients:
                         room.tick_debris(DEBRIS_DT)
+                        flush_rooms.append(room)
             if now - last_players >= PLAYERS_DT:
                 last_players = now
                 for room in list(rooms.values()):
@@ -1388,6 +1442,14 @@ def tick_loop() -> None:
                                 "serverLoot": True,
                             }
                         )
+                        flush_rooms.append(room)
+        seen = set()
+        for room in flush_rooms:
+            rid = id(room)
+            if rid in seen:
+                continue
+            seen.add(rid)
+            room.flush_outbox()
 
 
 def accept_ws(sock: socket.socket, req: bytes) -> bool:
