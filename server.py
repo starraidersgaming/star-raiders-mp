@@ -80,7 +80,7 @@ ENEMY_TYPES = [
     {"t": 10, "h": 180000, "s": 170, "d": 8000, "xp": 35000, "c": 20000, "r": 55, "fr": 4.0},
     {"t": 11, "h": 350000, "s": 100, "d": 15000, "xp": 75000, "c": 40000, "r": 60, "fr": 4.5},
     {"t": 12, "h": 750000, "s": 200, "d": 25000, "xp": 150000, "c": 80000, "r": 20, "fr": 5.0},
-    {"t": 13, "h": 1500000, "s": 120, "d": 40000, "xp": 300000, "c": 150000, "r": 60, "fr": 6.0},
+    {"t": 13, "h": 1500000, "s": 120, "d": 40000, "xp": 300000, "c": 150000, "r": 70, "fr": 6.0},
     {"t": 14, "h": 120000, "s": 45, "d": 1200, "xp": 15000, "c": 10000, "r": 150, "fr": 3.5, "boss": 1},
     {"t": 15, "h": 3000, "s": 220, "d": 300, "xp": 200, "c": 100, "r": 30, "fr": 2.5, "minion": 1},
 ]
@@ -308,11 +308,11 @@ class SectorRoom:
     # ── enemies ──────────────────────────────────────────────
 
     def serialize_enemy(self, e: dict) -> dict:
-        ang = float(e.get("ang") or e.get("w") or 1.0)
-        wand = float(e.get("w") or ang)
-        if abs(ang) < 0.05:
-            ang = wand if abs(wand) >= 0.05 else random.random() * math.pi * 2
-        if abs(wand) < 0.05:
+        ang = float(e.get("ang") or e.get("w") or 0.0)
+        wand = float(e.get("w") if e.get("w") is not None else ang)
+        if not math.isfinite(ang):
+            ang = wand if math.isfinite(wand) else random.random() * math.pi * 2
+        if not math.isfinite(wand):
             wand = ang
         out = {
             "t": int(e["t"]),
@@ -513,9 +513,10 @@ class SectorRoom:
             if e["h"] <= 0:
                 dead_ids.append(sid)
                 continue
-            if abs(float(e.get("w") or 0)) < 0.05:
+            # 0 is a valid heading (east) — do not rewrite near-zero angles.
+            if not math.isfinite(float(e.get("w") or 0)):
                 e["w"] = random.uniform(0.4, math.pi * 2 - 0.4)
-            if abs(float(e.get("ang") or 0)) < 0.05:
+            if not math.isfinite(float(e.get("ang") or 0)):
                 e["ang"] = e["w"]
 
             ox, oy = float(e["x"]), float(e["y"])
@@ -1478,8 +1479,12 @@ def tick_loop() -> None:
                 last_enemy = now
                 for room in list(rooms.values()):
                     if room.clients:
-                        room.tick_enemies(ENEMY_DT)
-                        flush_rooms.append(room)
+                        try:
+                            room.tick_enemies(ENEMY_DT)
+                            flush_rooms.append(room)
+                        except Exception as err:
+                            # One bad room must not kill the whole enemy sim loop.
+                            print(f"[SR-MP] tick_enemies area={room.area_index}: {err}")
             if now - last_debris >= DEBRIS_DT:
                 last_debris = now
                 for room in list(rooms.values()):
