@@ -36,9 +36,20 @@ PLAYERS_DT = 1.0 / PLAYERS_HZ
 WORLD = 6000.0
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HIT_DMG = 25000.0
-# Mining ticks (~12.5 Hz) + combat share one bucket; 28 dropped mine ticks mid-stream.
-MAX_HITS_PER_SEC = 48
+# Separate buckets so mining (~12.5 Hz) is not starved by laser spam.
+MAX_COMBAT_HITS_PER_SEC = 48
+MAX_MINE_HITS_PER_SEC = 20
 ASTEROID_MAX_HP = 200.0
+# Combat spacing — hold a mid-range band; stop shooting past FIRE_MAX.
+ENEMY_HOLD_MIN = 260.0
+ENEMY_HOLD_MAX = 360.0
+ENEMY_FIRE_MAX = 420.0
+BOSS_HOLD_MIN = 420.0
+BOSS_HOLD_MAX = 560.0
+BOSS_FIRE_MAX = 720.0
+MINION_HOLD_MIN = 220.0
+MINION_HOLD_MAX = 300.0
+MINION_FIRE_MAX = 380.0
 # Bump to force reseed of supply crates to the shared deterministic layout.
 LOOT_LAYOUT_VER = 1
 
@@ -62,13 +73,13 @@ ENEMY_TYPES = [
     {"t": 3, "h": 1000, "s": 80, "d": 150, "xp": 250, "c": 150, "r": 40, "fr": 1.5},
     {"t": 4, "h": 2500, "s": 140, "d": 350, "xp": 600, "c": 350, "r": 30, "fr": 2.0},
     {"t": 5, "h": 6000, "s": 90, "d": 600, "xp": 1200, "c": 700, "r": 50, "fr": 2.2},
-    {"t": 6, "h": 12000, "s": 150, "d": 1000, "xp": 2500, "c": 1500, "r": 22, "fr": 2.5},
-    {"t": 7, "h": 22000, "s": 110, "d": 1500, "xp": 4500, "c": 2800, "r": 32, "fr": 2.8},
-    {"t": 8, "h": 45000, "s": 160, "d": 2500, "xp": 8000, "c": 5000, "r": 27, "fr": 3.0},
-    {"t": 9, "h": 90000, "s": 85, "d": 4500, "xp": 18000, "c": 10000, "r": 45, "fr": 3.5},
-    {"t": 10, "h": 180000, "s": 170, "d": 8000, "xp": 35000, "c": 20000, "r": 35, "fr": 4.0},
-    {"t": 11, "h": 350000, "s": 100, "d": 15000, "xp": 75000, "c": 40000, "r": 55, "fr": 4.5},
-    {"t": 12, "h": 750000, "s": 200, "d": 25000, "xp": 150000, "c": 80000, "r": 30, "fr": 5.0},
+    {"t": 6, "h": 12000, "s": 150, "d": 1000, "xp": 2500, "c": 1500, "r": 48, "fr": 2.5},
+    {"t": 7, "h": 22000, "s": 110, "d": 1500, "xp": 4500, "c": 2800, "r": 46, "fr": 2.8},
+    {"t": 8, "h": 45000, "s": 160, "d": 2500, "xp": 8000, "c": 5000, "r": 50, "fr": 3.0},
+    {"t": 9, "h": 90000, "s": 85, "d": 4500, "xp": 18000, "c": 10000, "r": 60, "fr": 3.5},
+    {"t": 10, "h": 180000, "s": 170, "d": 8000, "xp": 35000, "c": 20000, "r": 55, "fr": 4.0},
+    {"t": 11, "h": 350000, "s": 100, "d": 15000, "xp": 75000, "c": 40000, "r": 60, "fr": 4.5},
+    {"t": 12, "h": 750000, "s": 200, "d": 25000, "xp": 150000, "c": 80000, "r": 20, "fr": 5.0},
     {"t": 13, "h": 1500000, "s": 120, "d": 40000, "xp": 300000, "c": 150000, "r": 60, "fr": 6.0},
     {"t": 14, "h": 120000, "s": 45, "d": 1200, "xp": 15000, "c": 10000, "r": 150, "fr": 3.5, "boss": 1},
     {"t": 15, "h": 3000, "s": 220, "d": 300, "xp": 200, "c": 100, "r": 30, "fr": 2.5, "minion": 1},
@@ -94,10 +105,10 @@ def enemy_cap(area: int) -> int:
 def type_for_area(area: int) -> dict:
     if area <= 0:
         return ENEMY_TYPES[0] if random.random() < 0.7 else ENEMY_TYPES[1]
-    # Match client: min(12, area) and next tier (not bosses)
+    # Match client: min(12, area) and next tier (13 = Core Sovereign; not bosses 14/15)
     de = min(12, max(0, area))
     a = ENEMY_TYPES[de]
-    b = ENEMY_TYPES[min(12, de + 1)]
+    b = ENEMY_TYPES[min(13, de + 1)]
     return a if random.random() < 0.6 else b
 
 
@@ -171,7 +182,7 @@ def ws_decode_frames(buf: bytearray):
 
 
 class Client:
-    __slots__ = ("sock", "nick", "is_host", "state", "buf", "alive", "hit_times")
+    __slots__ = ("sock", "nick", "is_host", "state", "buf", "alive", "combat_hit_times", "mine_hit_times")
 
     def __init__(self, sock: socket.socket):
         self.sock = sock
@@ -180,7 +191,8 @@ class Client:
         self.state: Dict[str, Any] = {}
         self.buf = bytearray()
         self.alive = True
-        self.hit_times: List[float] = []
+        self.combat_hit_times: List[float] = []
+        self.mine_hit_times: List[float] = []
 
     def send(self, obj: Any) -> None:
         if not self.alive:
@@ -191,12 +203,18 @@ class Client:
         except OSError:
             self.alive = False
 
-    def allow_hit(self) -> bool:
+    def allow_hit(self, mine: bool = False) -> bool:
         now = time.time()
-        self.hit_times = [t for t in self.hit_times if now - t < 1.0]
-        if len(self.hit_times) >= MAX_HITS_PER_SEC:
+        bucket = self.mine_hit_times if mine else self.combat_hit_times
+        limit = MAX_MINE_HITS_PER_SEC if mine else MAX_COMBAT_HITS_PER_SEC
+        keep = [t for t in bucket if now - t < 1.0]
+        if mine:
+            self.mine_hit_times = keep
+        else:
+            self.combat_hit_times = keep
+        if len(keep) >= limit:
             return False
-        self.hit_times.append(now)
+        keep.append(now)
         return True
 
 
@@ -242,6 +260,8 @@ class SectorRoom:
         self._outbox: List[Tuple["Client", str]] = []
         # nick -> last syncPlease wall time (rate-limit full snap replies)
         self._sync_please_at: Dict[str, float] = {}
+        # Keep empty rooms briefly so a reconnect does not reseed a brand-new world.
+        self._empty_since: Optional[float] = None
 
     def pick_host(self) -> None:
         # NEVER hand world authority to a phone/PC. Sticky-host on mobile was
@@ -512,21 +532,32 @@ class SectorRoom:
                     self.spawn_minion(e)
                     self.spawn_minion(e)
 
+            typ_i = int(e.get("t") or 0)
+            is_minion = typ_i == 15
+            if is_boss:
+                hold_min, hold_max, fire_max = BOSS_HOLD_MIN, BOSS_HOLD_MAX, BOSS_FIRE_MAX
+            elif is_minion:
+                hold_min, hold_max, fire_max = MINION_HOLD_MIN, MINION_HOLD_MAX, MINION_FIRE_MAX
+            else:
+                hold_min, hold_max, fire_max = ENEMY_HOLD_MIN, ENEMY_HOLD_MAX, ENEMY_FIRE_MAX
+
             if aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
                 desired = math.atan2(ty - e["y"], tx - e["x"])
                 e["w"] = desired
                 e["ang"] = desired
                 dist = pilot[3]
-                if dist > 160:
+                # Hold mid-range: close if too far, back off if too close, strafe in the band.
+                if dist > hold_max:
                     e["x"] += math.cos(desired) * speed * dt
                     e["y"] += math.sin(desired) * speed * dt
-                elif dist < 90:
-                    e["x"] -= math.cos(desired) * speed * 0.55 * dt
-                    e["y"] -= math.sin(desired) * speed * 0.55 * dt
+                elif dist < hold_min:
+                    e["x"] -= math.cos(desired) * speed * 0.7 * dt
+                    e["y"] -= math.sin(desired) * speed * 0.7 * dt
                 else:
-                    e["x"] += math.cos(desired + math.pi / 2) * speed * 0.35 * dt
-                    e["y"] += math.sin(desired + math.pi / 2) * speed * 0.35 * dt
+                    side = 1.0 if (hash(sid) & 1) else -1.0
+                    e["x"] += math.cos(desired + side * math.pi / 2) * speed * 0.4 * dt
+                    e["y"] += math.sin(desired + side * math.pi / 2) * speed * 0.4 * dt
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -548,7 +579,8 @@ class SectorRoom:
                 e["vx"] = 0.0
                 e["vy"] = 0.0
 
-            if aggro and pilot and pilot[3] < 480:
+            # Out of weapon range — face the pilot but do not keep firing across the map.
+            if aggro and pilot and hold_min * 0.45 <= pilot[3] <= fire_max:
                 fr = max(0.35, float(e.get("fr") or 1.0))
                 if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
                     e["last_fire"] = now
@@ -845,20 +877,21 @@ class SectorRoom:
         self.broadcast_debris()
 
     def roll_loot_reward(self) -> dict:
+        # World crates: smaller payouts so flying boxes aren't a free economy.
         roll = random.random()
-        if roll < 0.45:
-            amt = random.randint(250, 1000)
+        if roll < 0.5:
+            amt = random.randint(80, 350)
             return {"type": "credits", "amt": amt, "label": f"+{amt} CR", "color": "#fbbf24"}
-        if roll < 0.73:
-            amt = random.randint(25, 50)
+        if roll < 0.74:
+            amt = random.randint(10, 25)
             return {"type": "ammo_x2", "amt": amt, "label": f"+{amt} x2 AMMO", "color": "#67e8f9"}
-        if roll < 0.89:
-            amt = random.randint(1, 1000)
+        if roll < 0.9:
+            amt = random.randint(1, 400)
             return {"type": "xp", "amt": amt, "label": f"+{amt} XP", "color": "#86efac"}
         if roll < 0.97:
-            amt = random.randint(25, 50)
+            amt = random.randint(8, 20)
             return {"type": "ammo_x3", "amt": amt, "label": f"+{amt} x3 AMMO", "color": "#c084fc"}
-        amt = random.randint(1, 5)
+        amt = random.randint(1, 2)
         return {"type": "merits", "amt": amt, "label": f"+{amt} MR", "color": "#fde68a"}
 
     def apply_loot_collect(self, nick: str, sync_id: str, msg: dict) -> None:
@@ -917,11 +950,15 @@ class SectorRoom:
 
     def apply_hit(self, nick: str, msg: dict) -> None:
         c = self.clients.get(nick)
-        if not c or not c.allow_hit():
+        if not c:
             return
         sync_id = str(msg.get("syncId") or "")
         kind = msg.get("kind")
         dmg = clamp_dmg(float(msg.get("dmg") or 0))
+        # Mining ticks use a separate budget from lasers / collects.
+        is_mine = kind == "debris" or (sync_id.startswith("d") and kind not in ("rockCollect", "lootCollect"))
+        if not c.allow_hit(mine=is_mine):
+            return
 
         if kind == "lootCollect" or sync_id.startswith("l"):
             self.apply_loot_collect(nick, sync_id, msg)
@@ -1102,6 +1139,7 @@ class SectorRoom:
         }
         self.clients[nick] = client
         client.is_host = False
+        self._empty_since = None
         self.pick_host()
         self.ensure_enemies()
         self.ensure_debris()
@@ -1132,8 +1170,11 @@ class SectorRoom:
         self._sync_please_at.pop(nick, None)
         self.broadcast({"t": "leave", "nick": nick})
         if not self.clients:
-            rooms.pop(self.area_index, None)
+            # Do not destroy immediately — reconnecting players were getting a fresh
+            # random enemy field (looked like a full reshuffle on startup).
+            self._empty_since = time.time()
             return
+        self._empty_since = None
         # World always stays on SERVER — refresh host flags for remaining clients.
         self.pick_host()
 
@@ -1186,22 +1227,23 @@ class SectorRoom:
             s["palY"] = float(py)
         if isinstance(pa, (int, float)):
             s["palAngle"] = float(pa)
-        # Mining laser target (asteroid syncId + pose fallback)
-        mid = msg.get("mineId", msg.get("mid"))
-        if mid is None or mid == "" or mid is False:
-            s["mineId"] = None
-            s["mineX"] = None
-            s["mineY"] = None
-        else:
-            s["mineId"] = str(mid)[:48]
-            mx = msg.get("mineX", msg.get("mx"))
-            my = msg.get("mineY", msg.get("my"))
-            if isinstance(mx, (int, float)) and isinstance(my, (int, float)):
-                s["mineX"] = float(mx)
-                s["mineY"] = float(my)
-            else:
+        # Mining laser target — only update when the client sent mine keys (omit ≠ clear).
+        if "mineId" in msg or "mid" in msg:
+            mid = msg.get("mineId", msg.get("mid"))
+            if mid is None or mid == "" or mid is False:
+                s["mineId"] = None
                 s["mineX"] = None
                 s["mineY"] = None
+            else:
+                s["mineId"] = str(mid)[:48]
+                mx = msg.get("mineX", msg.get("mx"))
+                my = msg.get("mineY", msg.get("my"))
+                if isinstance(mx, (int, float)) and isinstance(my, (int, float)):
+                    s["mineX"] = float(mx)
+                    s["mineY"] = float(my)
+                else:
+                    s["mineX"] = None
+                    s["mineY"] = None
         s["lastActive"] = time.time() * 1000
         out = {
             "t": "state",
@@ -1406,15 +1448,32 @@ def client_thread(sock: socket.socket) -> None:
             pass
 
 
+# Empty sector rooms linger so a reconnect keeps the same enemy field.
+EMPTY_ROOM_GRACE_SEC = 90.0
+
+
 def tick_loop() -> None:
     last_enemy = 0.0
     last_debris = 0.0
     last_players = 0.0
+    last_prune = 0.0
     while True:
         time.sleep(0.02)
         now = time.time()
         flush_rooms: List[SectorRoom] = []
         with lock:
+            if now - last_prune >= 5.0:
+                last_prune = now
+                for area_idx, room in list(rooms.items()):
+                    if room.clients:
+                        room._empty_since = None
+                        continue
+                    empty_at = room._empty_since
+                    if empty_at is None:
+                        room._empty_since = now
+                        continue
+                    if now - float(empty_at) >= EMPTY_ROOM_GRACE_SEC:
+                        rooms.pop(area_idx, None)
             if now - last_enemy >= ENEMY_DT:
                 last_enemy = now
                 for room in list(rooms.values()):
