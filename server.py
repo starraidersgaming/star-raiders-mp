@@ -40,16 +40,16 @@ MAX_HIT_DMG = 25000.0
 MAX_COMBAT_HITS_PER_SEC = 48
 MAX_MINE_HITS_PER_SEC = 20
 ASTEROID_MAX_HP = 200.0
-# Combat spacing — hold a mid-range band; stop shooting past FIRE_MAX.
-ENEMY_HOLD_MIN = 260.0
-ENEMY_HOLD_MAX = 360.0
-ENEMY_FIRE_MAX = 420.0
-BOSS_HOLD_MIN = 420.0
-BOSS_HOLD_MAX = 560.0
-BOSS_FIRE_MAX = 720.0
-MINION_HOLD_MIN = 220.0
-MINION_HOLD_MAX = 300.0
-MINION_FIRE_MAX = 380.0
+# Combat spacing — hold a longer standoff band; face pilot and shoot from range.
+ENEMY_HOLD_MIN = 340.0
+ENEMY_HOLD_MAX = 460.0
+ENEMY_FIRE_MAX = 580.0
+BOSS_HOLD_MIN = 480.0
+BOSS_HOLD_MAX = 640.0
+BOSS_FIRE_MAX = 820.0
+MINION_HOLD_MIN = 280.0
+MINION_HOLD_MAX = 380.0
+MINION_FIRE_MAX = 500.0
 # Bump to force reseed of supply crates to the shared deterministic layout.
 LOOT_LAYOUT_VER = 1
 
@@ -544,21 +544,22 @@ class SectorRoom:
 
             if aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
-                desired = math.atan2(ty - e["y"], tx - e["x"])
-                e["w"] = desired
-                e["ang"] = desired
+                face = math.atan2(ty - e["y"], tx - e["x"])
+                # Always point the nose at the targeted pilot; move separately.
+                e["w"] = face
+                e["ang"] = face
                 dist = pilot[3]
-                # Hold mid-range: close if too far, back off if too close, strafe in the band.
+                # Hold standoff: close if too far, back off if too close, strafe in the band.
                 if dist > hold_max:
-                    e["x"] += math.cos(desired) * speed * dt
-                    e["y"] += math.sin(desired) * speed * dt
+                    e["x"] += math.cos(face) * speed * dt
+                    e["y"] += math.sin(face) * speed * dt
                 elif dist < hold_min:
-                    e["x"] -= math.cos(desired) * speed * 0.7 * dt
-                    e["y"] -= math.sin(desired) * speed * 0.7 * dt
+                    e["x"] -= math.cos(face) * speed * 0.75 * dt
+                    e["y"] -= math.sin(face) * speed * 0.75 * dt
                 else:
                     side = 1.0 if (hash(sid) & 1) else -1.0
-                    e["x"] += math.cos(desired + side * math.pi / 2) * speed * 0.4 * dt
-                    e["y"] += math.sin(desired + side * math.pi / 2) * speed * 0.4 * dt
+                    e["x"] += math.cos(face + side * math.pi / 2) * speed * 0.45 * dt
+                    e["y"] += math.sin(face + side * math.pi / 2) * speed * 0.45 * dt
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -580,14 +581,16 @@ class SectorRoom:
                 e["vx"] = 0.0
                 e["vy"] = 0.0
 
-            # Out of weapon range — face the pilot but do not keep firing across the map.
-            if aggro and pilot and hold_min * 0.45 <= pilot[3] <= fire_max:
+            # Shoot from standoff range while facing the pilot (no map-wide snipes).
+            if aggro and pilot and 90.0 <= pilot[3] <= fire_max:
                 fr = max(0.35, float(e.get("fr") or 1.0))
                 if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
                     e["last_fire"] = now
                     # Miss % only — clients home non-miss bolts so strafing cannot dodge.
                     will_miss = random.random() < 0.18
                     aim = math.atan2(pilot[2] - e["y"], pilot[1] - e["x"])
+                    e["ang"] = aim
+                    e["w"] = aim
                     if will_miss:
                         aim += (1 if random.random() < 0.5 else -1) * (0.22 + random.random() * 0.18)
                     spd = 400.0
