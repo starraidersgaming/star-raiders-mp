@@ -41,15 +41,22 @@ MAX_COMBAT_HITS_PER_SEC = 48
 MAX_MINE_HITS_PER_SEC = 20
 ASTEROID_MAX_HP = 200.0
 # Combat spacing — hold a longer standoff band; face pilot and shoot from range.
-ENEMY_HOLD_MIN = 340.0
-ENEMY_HOLD_MAX = 460.0
-ENEMY_FIRE_MAX = 580.0
-BOSS_HOLD_MIN = 480.0
-BOSS_HOLD_MAX = 640.0
-BOSS_FIRE_MAX = 820.0
-MINION_HOLD_MIN = 280.0
-MINION_HOLD_MAX = 380.0
-MINION_FIRE_MAX = 500.0
+# Match client getFireConeRange() — enemies shoot/chase on the same 400 cone as players.
+PLAYER_FIRE_CONE = 400.0
+ENEMY_TOO_CLOSE = 100.0
+BOSS_TOO_CLOSE = 140.0
+MINION_TOO_CLOSE = 90.0
+ENEMY_FLEE_HP = 0.25
+# Legacy names kept for any leftover refs; combat uses PLAYER_FIRE_CONE now.
+ENEMY_HOLD_MIN = 100.0
+ENEMY_HOLD_MAX = 400.0
+ENEMY_FIRE_MAX = 400.0
+BOSS_HOLD_MIN = 140.0
+BOSS_HOLD_MAX = 400.0
+BOSS_FIRE_MAX = 400.0
+MINION_HOLD_MIN = 90.0
+MINION_HOLD_MAX = 400.0
+MINION_FIRE_MAX = 400.0
 # Bump to force reseed of supply crates to the shared deterministic layout.
 LOOT_LAYOUT_VER = 1
 
@@ -535,12 +542,13 @@ class SectorRoom:
 
             typ_i = int(e.get("t") or 0)
             is_minion = typ_i == 15
+            fire_max = PLAYER_FIRE_CONE
             if is_boss:
-                hold_min, hold_max, fire_max = BOSS_HOLD_MIN, BOSS_HOLD_MAX, BOSS_FIRE_MAX
+                too_close = BOSS_TOO_CLOSE
             elif is_minion:
-                hold_min, hold_max, fire_max = MINION_HOLD_MIN, MINION_HOLD_MAX, MINION_FIRE_MAX
+                too_close = MINION_TOO_CLOSE
             else:
-                hold_min, hold_max, fire_max = ENEMY_HOLD_MIN, ENEMY_HOLD_MAX, ENEMY_FIRE_MAX
+                too_close = ENEMY_TOO_CLOSE
 
             if aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
@@ -549,17 +557,25 @@ class SectorRoom:
                 e["w"] = face
                 e["ang"] = face
                 dist = pilot[3]
-                # Hold standoff: close if too far, back off if too close, strafe in the band.
-                if dist > hold_max:
+                max_h = max(1.0, float(e.get("m") or e["h"] or 1))
+                fleeing = (float(e["h"]) / max_h) <= ENEMY_FLEE_HP
+                if fleeing:
+                    # Low HP: run away but keep facing the pilot (shots still fire in range).
+                    e["x"] -= math.cos(face) * speed * 0.95 * dt
+                    e["y"] -= math.sin(face) * speed * 0.95 * dt
+                elif dist > fire_max:
+                    # Player left cone range — chase back into it.
                     e["x"] += math.cos(face) * speed * dt
                     e["y"] += math.sin(face) * speed * dt
-                elif dist < hold_min:
-                    e["x"] -= math.cos(face) * speed * 0.75 * dt
-                    e["y"] -= math.sin(face) * speed * 0.75 * dt
+                elif dist < too_close:
+                    # Only peel if nearly overlapping — do not kite to the cone edge.
+                    e["x"] -= math.cos(face) * speed * 0.55 * dt
+                    e["y"] -= math.sin(face) * speed * 0.55 * dt
                 else:
+                    # Inside cone: light strafe, hold and shoot.
                     side = 1.0 if (hash(sid) & 1) else -1.0
-                    e["x"] += math.cos(face + side * math.pi / 2) * speed * 0.45 * dt
-                    e["y"] += math.sin(face + side * math.pi / 2) * speed * 0.45 * dt
+                    e["x"] += math.cos(face + side * math.pi / 2) * speed * 0.2 * dt
+                    e["y"] += math.sin(face + side * math.pi / 2) * speed * 0.2 * dt
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -581,7 +597,7 @@ class SectorRoom:
                 e["vx"] = 0.0
                 e["vy"] = 0.0
 
-            # Shoot from standoff range while facing the pilot (no map-wide snipes).
+            # Shoot inside the player fire cone while facing the pilot (incl. while fleeing).
             if aggro and pilot and 90.0 <= pilot[3] <= fire_max:
                 fr = max(0.35, float(e.get("fr") or 1.0))
                 if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
@@ -985,14 +1001,21 @@ class SectorRoom:
         e["h"] = max(0.0, float(e["h"]) - dmg)
         e["g"] = 1
         e["aggro_until"] = time.time() + 14.0
+        # First damaging pilot owns the kill credit (non-squad / attribution).
+        if not e.get("first_hit_by"):
+            e["first_hit_by"] = nick
         if int(e.get("t") or 0) == 14 and not e.get("drones_armed"):
             e["drones_armed"] = 1
             e["drones_to_spawn"] = 12
         kill = e["h"] <= 0
         hp_left = 0 if kill else int(e["h"])
         ex, ey = float(e.get("x") or 0), float(e.get("y") or 0)
+        credit_by = str(e.get("first_hit_by") or nick)
+        kill_type = int(e.get("t") or 0)
+        kill_xp = int(e.get("xp") or 0)
+        kill_credits = int(e.get("c") or 0)
         if kill:
-            was_boss = int(e.get("t") or 0) == 14
+            was_boss = kill_type == 14
             self.kills[sync_id] = time.time() * 1000
             corpse = self.serialize_enemy(e)
             corpse["h"] = 0
@@ -1006,23 +1029,26 @@ class SectorRoom:
                 self.respawn_queue.append((time.time() + 8.0, ex, ey))
             # Ore drops from kills (server-owned)
             self.spawn_enemy_ore(ex, ey, random.randint(1, 3))
-        self.broadcast(
-            {
-                "t": "hit",
-                "by": nick,
-                "syncId": sync_id,
-                "hp": hp_left,
-                "dmg": dmg,
-                "kill": kill,
-                "dead": kill,
-                "remove": kill,
-                "kind": kind or "enemy",
-                "x": ex,
-                "y": ey,
-                "ts": int(time.time() * 1000),
-            },
-            None,
-        )
+        hit_msg = {
+            "t": "hit",
+            "by": credit_by if kill else nick,
+            "finisher": nick if kill else None,
+            "syncId": sync_id,
+            "hp": hp_left,
+            "dmg": dmg,
+            "kill": kill,
+            "dead": kill,
+            "remove": kill,
+            "kind": kind or "enemy",
+            "x": ex,
+            "y": ey,
+            "ts": int(time.time() * 1000),
+        }
+        if kill:
+            hit_msg["typeIndex"] = kill_type
+            hit_msg["xp"] = kill_xp
+            hit_msg["credits"] = kill_credits
+        self.broadcast(hit_msg, None)
         # One enemy snap is enough (hit + corpse row). Ore appears on the next debris tick.
         self.broadcast_enemies()
 
