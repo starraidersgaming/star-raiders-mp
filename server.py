@@ -34,6 +34,12 @@ PLAYERS_HZ = 4.0
 PLAYERS_DT = 1.0 / PLAYERS_HZ
 
 WORLD = 6000.0
+BASE_X = WORLD / 2
+BASE_Y = WORLD / 2
+BASE_RADIUS = 250.0
+# Client activePortal uses portal.radius + 100.
+PORTAL_RADIUS = 60.0
+PORTAL_SAFE_PAD = 100.0
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HIT_DMG = 25000.0
 # Separate buckets so mining (~12.5 Hz) is not starved by laser spam.
@@ -41,7 +47,8 @@ MAX_COMBAT_HITS_PER_SEC = 48
 MAX_MINE_HITS_PER_SEC = 20
 ASTEROID_MAX_HP = 200.0
 # Match client getFireConeRange() — enemies shoot/chase on the same 400 cone as players.
-# In-range: hold still and fire. Out of range: chase. Never kite/strafe outward.
+# In-range: face + fire immediately, random strafe while staying inside the cone.
+# Out of range: chase. Never kite past the cone edge.
 PLAYER_FIRE_CONE = 400.0
 ENEMY_TOO_CLOSE = 100.0
 BOSS_TOO_CLOSE = 140.0
@@ -101,6 +108,36 @@ BOSS_VISUAL = {13: 3, 14: 6, 15: 9}
 
 def is_boss_zone(area: int) -> bool:
     return int(area) in BOSS_ZONES
+
+
+def area_portals(area: int) -> List[Tuple[float, float, float]]:
+    """Portal centers + radii matching client setupPortals() (safe-zone combat cancel)."""
+    a = int(area)
+    portals: List[Tuple[float, float, float]] = []
+    if is_boss_zone(a):
+        portals.append((500.0, WORLD - 500.0, PORTAL_RADIUS))
+        return portals
+    if a > 0:
+        portals.append((500.0, WORLD - 500.0, PORTAL_RADIUS))
+    if a < 12:
+        portals.append((WORLD - 500.0, 500.0, PORTAL_RADIUS))
+    boss_gate = {3: 13, 6: 14, 9: 15}
+    if a in boss_gate:
+        r = 85.0 if boss_gate[a] == 13 else PORTAL_RADIUS
+        portals.append((WORLD / 2, WORLD / 2, r))
+    return portals
+
+
+def point_in_safe_zone(area: int, x: float, y: float) -> bool:
+    """Home Base (sector 0) or any portal ring — pilots here are combat-safe."""
+    a = int(area)
+    if a == 0 and math.hypot(float(x) - BASE_X, float(y) - BASE_Y) < BASE_RADIUS:
+        return True
+    pad = PORTAL_SAFE_PAD
+    for px, py, pr in area_portals(a):
+        if math.hypot(float(x) - px, float(y) - py) < pr + pad:
+            return True
+    return False
 
 
 def enemy_cap(area: int) -> int:
@@ -496,13 +533,15 @@ class SectorRoom:
         e["g"] = 1
         e["aggro_until"] = time.time() + 20.0
 
-    def nearest_pilot(self, x: float, y: float) -> Optional[Tuple[str, float, float, float]]:
+    def nearest_pilot(self, x: float, y: float, *, combat: bool = False) -> Optional[Tuple[str, float, float, float]]:
         best = None
         best_d = 1e18
         for nick, c in self.clients.items():
             s = c.state
             px = float(s.get("x") or 0)
             py = float(s.get("y") or 0)
+            if combat and point_in_safe_zone(self.area_index, px, py):
+                continue
             d = math.hypot(px - x, py - y)
             if d < best_d:
                 best_d = d
@@ -527,8 +566,14 @@ class SectorRoom:
                 e["ang"] = e["w"]
 
             ox, oy = float(e["x"]), float(e["y"])
-            pilot = self.nearest_pilot(e["x"], e["y"])
+            # Combat ignores pilots inside Home Base / portal safe zones.
+            pilot = self.nearest_pilot(e["x"], e["y"], combat=True)
             aggro = float(e.get("aggro_until") or 0) > now
+            # No valid combat target (everyone safe / gone) → drop chase and resume patrol.
+            if aggro and not pilot:
+                e["aggro_until"] = 0.0
+                aggro = False
+                e["strafe_dir"] = 0.0
             e["g"] = 1 if aggro else 0
             speed = float(e["s"])
             is_boss = int(e.get("t") or 0) == 14
@@ -547,7 +592,7 @@ class SectorRoom:
             if aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
                 face = math.atan2(ty - e["y"], tx - e["x"])
-                # Always point the nose at the targeted pilot; move only to close range.
+                # Snap nose onto the pilot immediately and open fire the same tick.
                 e["w"] = face
                 e["ang"] = face
                 dist = pilot[3]
@@ -555,7 +600,36 @@ class SectorRoom:
                     # Player left cone range — chase back into it.
                     e["x"] += math.cos(face) * speed * dt
                     e["y"] += math.sin(face) * speed * dt
-                # else: in cone — hold position and keep firing (no strafe / peel / flee).
+                else:
+                    # In cone: random lateral strafe, stay inside fire range.
+                    side = float(e.get("strafe_dir") or 0)
+                    if side == 0.0:
+                        side = 1.0 if (hash(sid) & 1) else -1.0
+                        e["strafe_dir"] = side
+                    if random.random() < 0.35 * dt:
+                        side = -side
+                        e["strafe_dir"] = side
+                    move = face + side * math.pi / 2
+                    scale = 0.28 if is_minion else (0.22 if not is_boss else 0.2)
+                    if dist > fire_max * 0.88:
+                        # Near cone edge — bias inward so they do not drift out of range.
+                        move = math.atan2(
+                            math.sin(move) * 0.55 + math.sin(face) * 0.9,
+                            math.cos(move) * 0.55 + math.cos(face) * 0.9,
+                        )
+                        scale = 0.35
+                    elif dist < (140.0 if is_boss else 85.0):
+                        move = math.atan2(
+                            math.sin(move) * 0.4 - math.sin(face) * 0.85,
+                            math.cos(move) * 0.4 - math.cos(face) * 0.85,
+                        )
+                        scale = 0.3
+                    e["x"] += math.cos(move) * speed * scale * dt
+                    e["y"] += math.sin(move) * speed * scale * dt
+                    # Keep facing the pilot after the strafe step.
+                    face = math.atan2(ty - e["y"], tx - e["x"])
+                    e["w"] = face
+                    e["ang"] = face
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -574,10 +648,6 @@ class SectorRoom:
                 e["vx"] = (float(e["x"]) - ox) / dt
                 e["vy"] = (float(e["y"]) - oy) / dt
             else:
-                e["vx"] = 0.0
-                e["vy"] = 0.0
-            # Holding still must publish zero velocity so clients do not keep sliding outward.
-            if aggro and pilot and float(pilot[3]) <= fire_max:
                 e["vx"] = 0.0
                 e["vy"] = 0.0
 
