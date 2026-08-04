@@ -40,8 +40,8 @@ MAX_HIT_DMG = 25000.0
 MAX_COMBAT_HITS_PER_SEC = 48
 MAX_MINE_HITS_PER_SEC = 20
 ASTEROID_MAX_HP = 200.0
-# Combat spacing — hold a longer standoff band; face pilot and shoot from range.
 # Match client getFireConeRange() — enemies shoot/chase on the same 400 cone as players.
+# In-range: hold still and fire. Out of range: chase. Never kite/strafe outward.
 PLAYER_FIRE_CONE = 400.0
 ENEMY_TOO_CLOSE = 100.0
 BOSS_TOO_CLOSE = 140.0
@@ -543,39 +543,19 @@ class SectorRoom:
             typ_i = int(e.get("t") or 0)
             is_minion = typ_i == 15
             fire_max = PLAYER_FIRE_CONE
-            if is_boss:
-                too_close = BOSS_TOO_CLOSE
-            elif is_minion:
-                too_close = MINION_TOO_CLOSE
-            else:
-                too_close = ENEMY_TOO_CLOSE
 
             if aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
                 face = math.atan2(ty - e["y"], tx - e["x"])
-                # Always point the nose at the targeted pilot; move separately.
+                # Always point the nose at the targeted pilot; move only to close range.
                 e["w"] = face
                 e["ang"] = face
                 dist = pilot[3]
-                max_h = max(1.0, float(e.get("m") or e["h"] or 1))
-                fleeing = (float(e["h"]) / max_h) <= ENEMY_FLEE_HP
-                if fleeing:
-                    # Low HP: run away but keep facing the pilot (shots still fire in range).
-                    e["x"] -= math.cos(face) * speed * 0.95 * dt
-                    e["y"] -= math.sin(face) * speed * 0.95 * dt
-                elif dist > fire_max:
+                if dist > fire_max:
                     # Player left cone range — chase back into it.
                     e["x"] += math.cos(face) * speed * dt
                     e["y"] += math.sin(face) * speed * dt
-                elif dist < too_close:
-                    # Only peel if nearly overlapping — do not kite to the cone edge.
-                    e["x"] -= math.cos(face) * speed * 0.55 * dt
-                    e["y"] -= math.sin(face) * speed * 0.55 * dt
-                else:
-                    # Inside cone: light strafe, hold and shoot.
-                    side = 1.0 if (hash(sid) & 1) else -1.0
-                    e["x"] += math.cos(face + side * math.pi / 2) * speed * 0.2 * dt
-                    e["y"] += math.sin(face + side * math.pi / 2) * speed * 0.2 * dt
+                # else: in cone — hold position and keep firing (no strafe / peel / flee).
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -596,8 +576,12 @@ class SectorRoom:
             else:
                 e["vx"] = 0.0
                 e["vy"] = 0.0
+            # Holding still must publish zero velocity so clients do not keep sliding outward.
+            if aggro and pilot and float(pilot[3]) <= fire_max:
+                e["vx"] = 0.0
+                e["vy"] = 0.0
 
-            # Shoot inside the player fire cone while facing the pilot (incl. while fleeing).
+            # Shoot inside the player fire cone while facing the pilot.
             if aggro and pilot and 90.0 <= pilot[3] <= fire_max:
                 fr = max(0.35, float(e.get("fr") or 1.0))
                 if now - float(e.get("last_fire") or 0) >= 1.0 / fr:
@@ -610,6 +594,7 @@ class SectorRoom:
                     if will_miss:
                         aim += (1 if random.random() < 0.5 else -1) * (0.22 + random.random() * 0.18)
                     spd = 400.0
+                    nose = max(12.0, float(e.get("r") or 20.0) * 0.9)
                     self._shot_seq = getattr(self, "_shot_seq", 0) + 1
                     self.enemy_shots.append(
                         {
@@ -617,8 +602,8 @@ class SectorRoom:
                             "areaIndex": self.area_index,
                             "sourceEnemyId": sid,
                             "targetNick": pilot[0],
-                            "x": float(e["x"]),
-                            "y": float(e["y"]),
+                            "x": float(e["x"]) + math.cos(aim) * nose,
+                            "y": float(e["y"]) + math.sin(aim) * nose,
                             "vx": math.cos(aim) * spd,
                             "vy": math.sin(aim) * spd,
                             "a": aim,
