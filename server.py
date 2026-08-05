@@ -140,6 +140,126 @@ def point_in_safe_zone(area: int, x: float, y: float) -> bool:
     return False
 
 
+def enemy_safe_clearance(area: int, x: float, y: float, enemy_r: float = 20.0) -> Optional[Tuple[float, float, float]]:
+    """If (x,y) is inside a safe bubble (+ hull), return (cx, cy, edge_r) to push to."""
+    a = int(area)
+    er = max(12.0, float(enemy_r or 20.0))
+    cushion = 40.0
+    if a == 0:
+        d = math.hypot(float(x) - BASE_X, float(y) - BASE_Y)
+        edge = BASE_RADIUS + er + cushion
+        if d < edge:
+            return (BASE_X, BASE_Y, edge)
+    for px, py, pr in area_portals(a):
+        edge = float(pr) + PORTAL_SAFE_PAD + er + cushion
+        d = math.hypot(float(x) - px, float(y) - py)
+        if d < edge:
+            return (px, py, edge)
+    return None
+
+
+def nearest_safe_zone(
+    area: int, x: float, y: float, enemy_r: float = 20.0
+) -> Optional[Tuple[float, float, float, float]]:
+    """Nearest safe bubble. Returns (cx, cy, edge, dist) or None."""
+    a = int(area)
+    er = max(12.0, float(enemy_r or 20.0))
+    cushion = 40.0
+    best = None
+    best_d = 1e18
+    zones = []
+    if a == 0:
+        zones.append((BASE_X, BASE_Y, BASE_RADIUS + er + cushion))
+    for px, py, pr in area_portals(a):
+        zones.append((px, py, float(pr) + PORTAL_SAFE_PAD + er + cushion))
+    for cx, cy, edge in zones:
+        d = math.hypot(float(x) - cx, float(y) - cy)
+        if d < best_d:
+            best_d = d
+            best = (cx, cy, edge, max(d, 1e-3))
+    return best
+
+
+def push_xy_from_safe(area: int, x: float, y: float, enemy_r: float = 20.0) -> Tuple[float, float, bool]:
+    """Push a point onto the rim of any overlapping safe zone. Returns (x, y, pushed)."""
+    hit = enemy_safe_clearance(area, x, y, enemy_r)
+    if not hit:
+        return float(x), float(y), False
+    cx, cy, edge = hit
+    dx = float(x) - cx
+    dy = float(y) - cy
+    d = math.hypot(dx, dy)
+    if d < 1e-3:
+        ang = random.random() * math.pi * 2
+        return cx + math.cos(ang) * (edge + 10.0), cy + math.sin(ang) * (edge + 10.0), True
+    s = (edge + 10.0) / d
+    return cx + dx * s, cy + dy * s, True
+
+
+def update_safe_redirect(
+    e: dict,
+    area: int,
+    heading: float,
+) -> Optional[float]:
+    """
+    Hard peel-away from safe zones with hysteresis.
+    Returns escape heading while redirect is active, else None.
+    """
+    er = float(e.get("r") or 20.0)
+    zone = nearest_safe_zone(area, float(e["x"]), float(e["y"]), er)
+    if not zone:
+        e["safe_redirect"] = 0
+        e["safe_side"] = 0.0
+        e.pop("safe_w", None)
+        return None
+    cx, cy, edge, d = zone
+    hit_pad = 90.0
+    clear_pad = 220.0
+    inside = d < edge
+    near = d < edge + hit_pad
+    clear = d > edge + clear_pad
+    active = int(e.get("safe_redirect") or 0) == 1
+    if active:
+        if clear:
+            e["safe_redirect"] = 0
+            e["safe_side"] = 0.0
+            e.pop("safe_w", None)
+            return None
+    elif not (inside or near):
+        return None
+    else:
+        e["safe_redirect"] = 1
+
+    out_x = (float(e["x"]) - cx) / d
+    out_y = (float(e["y"]) - cy) / d
+    if inside:
+        rim = edge + 10.0
+        e["x"] = cx + out_x * rim
+        e["y"] = cy + out_y * rim
+        e["aggro_until"] = 0.0
+        e["strafe_dir"] = 0.0
+        e["g"] = 0
+
+    head = float(e.get("safe_w") or heading)
+    hx = math.cos(head)
+    hy = math.sin(head)
+    side = float(e.get("safe_side") or 0.0)
+    if side not in (1.0, -1.0):
+        d_a = hx * (-out_y) + hy * out_x
+        d_b = hx * out_y + hy * (-out_x)
+        side = 1.0 if d_a >= d_b else -1.0
+        e["safe_side"] = side
+    # Lock escape heading on first engage — straight peel, not an orbiting curve.
+    if e.get("safe_w") is None or not math.isfinite(float(e.get("safe_w"))):
+        t_x = side * (-out_y)
+        t_y = side * out_x
+        escape = math.atan2(out_y * 0.88 + t_y * 0.35, out_x * 0.88 + t_x * 0.35)
+        e["safe_w"] = escape
+    else:
+        escape = float(e["safe_w"])
+    return escape
+
+
 def enemy_cap(area: int) -> int:
     if is_boss_zone(area):
         return 0  # boss + minions managed separately
@@ -352,8 +472,21 @@ class SectorRoom:
     # ── enemies ──────────────────────────────────────────────
 
     def serialize_enemy(self, e: dict) -> dict:
-        ang = float(e.get("ang") or e.get("w") or 0.0)
-        wand = float(e.get("w") if e.get("w") is not None else ang)
+        # Do not use `or` on angles — 0.0 is a valid heading (east).
+        ang_raw = e.get("ang")
+        if ang_raw is None:
+            ang_raw = e.get("w")
+        try:
+            ang = float(ang_raw)
+        except (TypeError, ValueError):
+            ang = 0.0
+        wand_raw = e.get("w")
+        if wand_raw is None:
+            wand_raw = ang
+        try:
+            wand = float(wand_raw)
+        except (TypeError, ValueError):
+            wand = ang
         if not math.isfinite(ang):
             ang = wand if math.isfinite(wand) else random.random() * math.pi * 2
         if not math.isfinite(wand):
@@ -493,6 +626,9 @@ class SectorRoom:
         return sid
 
     def _spawn_point_ok(self, x: float, y: float, avoid_x: Optional[float], avoid_y: Optional[float]) -> bool:
+        # Keep spawns outside Home Base / portal safe bubbles (plus a little margin).
+        if enemy_safe_clearance(self.area_index, x, y, 40.0) is not None:
+            return False
         if self.area_index == 0 and math.hypot(x - WORLD / 2, y - WORLD / 2) < 700:
             return False
         if avoid_x is not None and avoid_y is not None and math.hypot(x - avoid_x, y - avoid_y) < 900:
@@ -589,7 +725,22 @@ class SectorRoom:
             is_minion = typ_i == 15
             fire_max = PLAYER_FIRE_CONE
 
-            if aggro and pilot:
+            # Hard safe-zone peel takes priority — no chase-into-bubble then bounce.
+            escape = update_safe_redirect(e, self.area_index, float(e.get("w") or 0.0))
+            if escape is not None:
+                peel = 0.55 if is_boss else 0.45
+                e["x"] += math.cos(escape) * speed * peel * dt
+                e["y"] += math.sin(escape) * speed * peel * dt
+                e["w"] = escape
+                e["ang"] = escape
+                e["aggro_until"] = 0.0
+                e["strafe_dir"] = 0.0
+                e["g"] = 0
+                aggro = False
+                nx, ny, pushed = push_xy_from_safe(self.area_index, e["x"], e["y"], float(e.get("r") or 20.0))
+                if pushed:
+                    e["x"], e["y"] = nx, ny
+            elif aggro and pilot:
                 tx, ty = pilot[1], pilot[2]
                 face = math.atan2(ty - e["y"], tx - e["x"])
                 # Snap nose onto the pilot immediately and open fire the same tick.
@@ -598,8 +749,8 @@ class SectorRoom:
                 dist = pilot[3]
                 if dist > fire_max:
                     # Player left cone range — chase back into it.
-                    e["x"] += math.cos(face) * speed * dt
-                    e["y"] += math.sin(face) * speed * dt
+                    move = face
+                    scale = 1.0
                 else:
                     # In cone: random lateral strafe, stay inside fire range.
                     side = float(e.get("strafe_dir") or 0)
@@ -624,12 +775,23 @@ class SectorRoom:
                             math.cos(move) * 0.4 - math.cos(face) * 0.85,
                         )
                         scale = 0.3
-                    e["x"] += math.cos(move) * speed * scale * dt
-                    e["y"] += math.sin(move) * speed * scale * dt
-                    # Keep facing the pilot after the strafe step.
-                    face = math.atan2(ty - e["y"], tx - e["x"])
-                    e["w"] = face
-                    e["ang"] = face
+                e["x"] += math.cos(move) * speed * scale * dt
+                e["y"] += math.sin(move) * speed * scale * dt
+                # Keep facing the pilot after the strafe step.
+                face = math.atan2(ty - e["y"], tx - e["x"])
+                e["w"] = face
+                e["ang"] = face
+                nx, ny, pushed = push_xy_from_safe(self.area_index, e["x"], e["y"], float(e.get("r") or 20.0))
+                if pushed:
+                    e["x"], e["y"] = nx, ny
+                    escape2 = update_safe_redirect(e, self.area_index, float(e.get("w") or 0.0))
+                    if escape2 is not None:
+                        e["w"] = escape2
+                        e["ang"] = escape2
+                        e["aggro_until"] = 0.0
+                        e["strafe_dir"] = 0.0
+                        e["g"] = 0
+                        aggro = False
             else:
                 if random.random() < 0.35 * dt:
                     e["w"] = float(e["w"]) + (random.random() - 0.5) * 2.2
@@ -638,6 +800,13 @@ class SectorRoom:
                 e["ang"] = e["w"]
                 e["x"] += math.cos(e["w"]) * speed * 0.3 * dt
                 e["y"] += math.sin(e["w"]) * speed * 0.3 * dt
+                nx, ny, pushed = push_xy_from_safe(self.area_index, e["x"], e["y"], float(e.get("r") or 20.0))
+                if pushed:
+                    e["x"], e["y"] = nx, ny
+                    escape2 = update_safe_redirect(e, self.area_index, float(e.get("w") or 0.0))
+                    if escape2 is not None:
+                        e["w"] = escape2
+                        e["ang"] = escape2
 
             if e["x"] < margin or e["x"] > WORLD - margin or e["y"] < margin or e["y"] > WORLD - margin:
                 e["w"] = math.atan2(WORLD / 2 - e["y"], WORLD / 2 - e["x"]) + (random.random() - 0.5) * 0.6
