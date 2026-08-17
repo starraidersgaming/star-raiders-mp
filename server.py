@@ -33,7 +33,7 @@ DEBRIS_DT = max(1.0 / 15.0, 1.0 / max(1.0, DEBRIS_HZ))
 PLAYERS_HZ = 4.0
 PLAYERS_DT = 1.0 / PLAYERS_HZ
 
-WORLD = 6000.0
+WORLD = 12000.0
 BASE_X = WORLD / 2
 BASE_Y = WORLD / 2
 BASE_RADIUS = 250.0
@@ -263,7 +263,7 @@ def update_safe_redirect(
 def enemy_cap(area: int) -> int:
     if is_boss_zone(area):
         return 0  # boss + minions managed separately
-    return 75 if area == 0 else 55
+    return 150 if area == 0 else 110
 
 
 def type_for_area(area: int) -> dict:
@@ -281,10 +281,10 @@ def debris_count_for_area(area: int) -> int:
         return 0
     o = area
     if o == 0:
-        return 80
+        return 160
     if o in (2, 7, 10, 11):
-        return 10
-    return 40
+        return 20
+    return 80
 
 
 def clamp_dmg(raw: float) -> float:
@@ -932,8 +932,8 @@ class SectorRoom:
             }
 
     def seed_rocks(self) -> None:
-        # Match sticky-host setupRocks: 60 free-floating ore (also in boss zones).
-        for _ in range(60):
+        # Match sticky-host setupRocks: 120 free-floating ore (also in boss zones).
+        for _ in range(120):
             self.spawn_rock(
                 random.uniform(0, WORLD),
                 random.uniform(0, WORLD),
@@ -1387,6 +1387,7 @@ class SectorRoom:
             "isRankOne": bool(msg.get("isRankOne")),
             "isGM": bool(msg.get("isGM")),
             "isMod": bool(msg.get("isMod")),
+            "isVIP": bool(msg.get("isVIP") or msg.get("isVip")),
             "killPoints": int(msg.get("killPoints") or 0),
             "activeTitle": str(msg.get("activeTitle") or "")[:48] or None,
             "lastActive": time.time() * 1000,
@@ -1445,9 +1446,11 @@ class SectorRoom:
                 s[k] = int(msg[k])
         if "inHangar" in msg:
             s["inHangar"] = bool(msg["inHangar"])
-        for k in ("isGM", "isMod", "hasBetaBadge", "isRankOne"):
+        for k in ("isGM", "isMod", "isVIP", "hasBetaBadge", "isRankOne"):
             if k in msg:
                 s[k] = bool(msg[k])
+        if "isVip" in msg and "isVIP" not in msg:
+            s["isVIP"] = bool(msg["isVip"])
         if "killPoints" in msg and msg["killPoints"] is not None:
             try:
                 s["killPoints"] = int(msg["killPoints"])
@@ -1516,6 +1519,7 @@ class SectorRoom:
             "inHangar": s["inHangar"],
             "isGM": s.get("isGM", False),
             "isMod": s.get("isMod", False),
+            "isVIP": s.get("isVIP", False),
             "hasBetaBadge": s.get("hasBetaBadge", False),
             "isRankOne": s.get("isRankOne", False),
             "killPoints": s.get("killPoints", 0),
@@ -1623,7 +1627,7 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
                     # starved tick_enemies when clients spammed syncPlease on roster ticks.
                     now_sp = time.time()
                     last_sp = float(room._sync_please_at.get(nick) or 0.0)
-                    if now_sp - last_sp >= 1.5:
+                    if now_sp - last_sp >= 3.5:
                         room._sync_please_at[nick] = now_sp
                         room.ensure_enemies()
                         room.ensure_debris()
