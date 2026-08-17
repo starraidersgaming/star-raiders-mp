@@ -39,6 +39,7 @@ BASE_Y = WORLD / 2
 BASE_RADIUS = 250.0
 # Client activePortal uses portal.radius + 100.
 PORTAL_RADIUS = 60.0
+PORTAL_INSET = 360.0
 PORTAL_SAFE_PAD = 100.0
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HIT_DMG = 25000.0
@@ -115,12 +116,12 @@ def area_portals(area: int) -> List[Tuple[float, float, float]]:
     a = int(area)
     portals: List[Tuple[float, float, float]] = []
     if is_boss_zone(a):
-        portals.append((500.0, WORLD - 500.0, PORTAL_RADIUS))
+        portals.append((PORTAL_INSET, WORLD - PORTAL_INSET, PORTAL_RADIUS))
         return portals
     if a > 0:
-        portals.append((500.0, WORLD - 500.0, PORTAL_RADIUS))
+        portals.append((PORTAL_INSET, WORLD - PORTAL_INSET, PORTAL_RADIUS))
     if a < 12:
-        portals.append((WORLD - 500.0, 500.0, PORTAL_RADIUS))
+        portals.append((WORLD - PORTAL_INSET, PORTAL_INSET, PORTAL_RADIUS))
     boss_gate = {3: 13, 6: 14, 9: 15}
     if a in boss_gate:
         r = 85.0 if boss_gate[a] == 13 else PORTAL_RADIUS
