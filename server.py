@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Star Raiders — realtime sector sync server (Python 3.10+, stdlib only)
+Sector Rift — realtime sector sync server (Python 3.10+, stdlib only)
 
 Rooms are per areaIndex.
 SERVER-OWNED: enemies (incl. bosses/minions), asteroids/debris, ore rocks, loot boxes.
@@ -17,11 +17,17 @@ import json
 import math
 import os
 import random
+import re
 import select
+import smtplib
 import socket
 import struct
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 
 PORT = int(os.environ.get("PORT", "8787"))
@@ -67,6 +73,15 @@ MINION_HOLD_MAX = 400.0
 MINION_FIRE_MAX = 400.0
 # Bump to force reseed of supply crates to the shared deterministic layout.
 LOOT_LAYOUT_VER = 1
+FIREBASE_DB = os.environ.get("FIREBASE_DB", "https://star-raiders-659bb-default-rtdb.firebaseio.com").rstrip("/")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+MAIL_FROM = os.environ.get("MAIL_FROM", "Sector Rift <onboarding@resend.dev>").strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.office365.com").strip()
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER", "JumpingGoblinStudios@Outlook.com").strip()
+SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+_recover_last: Dict[str, float] = {}
+_recover_lock = threading.Lock()
 
 
 def area_loot_rnd(area_index: int):
@@ -96,11 +111,72 @@ ENEMY_TYPES = [
     {"t": 11, "h": 350000, "s": 100, "d": 15000, "xp": 75000, "c": 40000, "r": 60, "fr": 4.5},
     {"t": 12, "h": 750000, "s": 200, "d": 25000, "xp": 150000, "c": 80000, "r": 20, "fr": 5.0},
     {"t": 13, "h": 1500000, "s": 120, "d": 40000, "xp": 300000, "c": 150000, "r": 70, "fr": 6.0},
-    {"t": 14, "h": 120000, "s": 45, "d": 1200, "xp": 15000, "c": 10000, "r": 150, "fr": 3.5, "boss": 1},
-    {"t": 15, "h": 3000, "s": 220, "d": 300, "xp": 200, "c": 100, "r": 30, "fr": 2.5, "minion": 1},
+    {"t": 14, "h": 200000, "s": 45, "d": 60, "xp": 15000, "c": 10000, "r": 150, "fr": 0.7, "boss": 1},
+    {"t": 15, "h": 1200, "s": 220, "d": 30, "xp": 200, "c": 100, "r": 30, "fr": 1.0, "minion": 1},
 ]
 BOSS_TYPE = ENEMY_TYPES[14]
 MINION_TYPE = ENEMY_TYPES[15]
+BOSS_LOOT_SLOTS = ("laser", "shield", "engine", "accuracy", "firerate", "bot", "capacitor")
+BOSS_LOOT_COUNT = 3
+BOSS_LOOT_SHARE_PCT = 0.05
+
+
+def roll_boss_rarity() -> str:
+    le = random.random()
+    if le < 0.04:
+        return "Legendary"
+    if le < 0.14:
+        return "Epic"
+    if le < 0.32:
+        return "Rare"
+    if le < 0.58:
+        return "Uncommon"
+    return "Common"
+
+
+def assign_boss_loot(nicks: List[str]) -> Dict[str, List[str]]:
+    seen_sets: set = set()
+    out: Dict[str, List[str]] = {}
+    slots_all = list(BOSS_LOOT_SLOTS)
+    for nick in nicks:
+        key = str(nick or "").upper()
+        if not key or key in out:
+            continue
+        pieces: List[str] = []
+        for _attempt in range(40):
+            slots = slots_all[:]
+            random.shuffle(slots)
+            picked = slots[:BOSS_LOOT_COUNT]
+            pieces = [f"{slot}_{roll_boss_rarity().lower()}" for slot in picked]
+            sig = tuple(sorted(pieces))
+            if sig and sig not in seen_sets:
+                seen_sets.add(sig)
+                break
+        out[key] = pieces
+    return out
+
+
+def boss_loot_eligible(dmg_by: dict, max_hp: float, fallback: str = "") -> List[str]:
+    hp = max(1.0, float(max_hp) or 1.0)
+    need = BOSS_LOOT_SHARE_PCT * hp
+    scored = []
+    for raw, dmg in (dmg_by or {}).items():
+        nick = str(raw or "").upper()
+        amt = float(dmg or 0)
+        if nick and amt >= need:
+            scored.append((amt, nick))
+    scored.sort(reverse=True)
+    out = []
+    seen = set()
+    for _amt, nick in scored:
+        if nick not in seen:
+            seen.add(nick)
+            out.append(nick)
+    if not out:
+        fb = str(fallback or "").upper()
+        if fb:
+            out.append(fb)
+    return out
 ORE_TYPES = (("iron", 2), ("gold", 3), ("crystal", 4))
 BOSS_ZONES = frozenset((13, 14, 15))
 # Visual area index for debris counts in boss zones (matches client Fe.baseVisualIndex)
@@ -623,6 +699,7 @@ class SectorRoom:
             "last_drone_spawn": 0.0,
             "boss": 1 if typ.get("boss") else 0,
             "minion": 1 if typ.get("minion") else 0,
+            "dmg_by": {},
         }
         return sid
 
@@ -1226,21 +1303,31 @@ class SectorRoom:
         e["h"] = max(0.0, float(e["h"]) - dmg)
         e["g"] = 1
         e["aggro_until"] = time.time() + 14.0
+        who = str(nick or "").upper()
+        dmg_by = e.get("dmg_by")
+        if not isinstance(dmg_by, dict):
+            dmg_by = {}
+            e["dmg_by"] = dmg_by
+        dmg_by[who] = float(dmg_by.get(who) or 0) + float(dmg)
         # First damaging pilot owns the kill credit (non-squad / attribution).
         if not e.get("first_hit_by"):
             e["first_hit_by"] = nick
         if int(e.get("t") or 0) == 14 and not e.get("drones_armed"):
             e["drones_armed"] = 1
-            e["drones_to_spawn"] = 12
+            e["drones_to_spawn"] = 6
         kill = e["h"] <= 0
         hp_left = 0 if kill else int(e["h"])
         ex, ey = float(e.get("x") or 0), float(e.get("y") or 0)
-        credit_by = str(e.get("first_hit_by") or nick)
+        credit_by = str(e.get("first_hit_by") or who)
         kill_type = int(e.get("t") or 0)
         kill_xp = int(e.get("xp") or 0)
         kill_credits = int(e.get("c") or 0)
+        boss_loot = None
         if kill:
             was_boss = kill_type == 14
+            if was_boss:
+                elig = boss_loot_eligible(e.get("dmg_by") or {}, e.get("m") or 0, credit_by)
+                boss_loot = assign_boss_loot(elig)
             self.kills[sync_id] = time.time() * 1000
             corpse = self.serialize_enemy(e)
             corpse["h"] = 0
@@ -1273,6 +1360,8 @@ class SectorRoom:
             hit_msg["typeIndex"] = kill_type
             hit_msg["xp"] = kill_xp
             hit_msg["credits"] = kill_credits
+            if boss_loot:
+                hit_msg["bossLoot"] = boss_loot
         self.broadcast(hit_msg, None)
         # One enemy snap is enough (hit + corpse row). Ore appears on the next debris tick.
         self.broadcast_enemies()
@@ -1359,7 +1448,17 @@ class SectorRoom:
             return None
         prev = self.clients.get(nick)
         if prev and prev is not client:
-            prev.alive = False
+            if prev.alive:
+                try:
+                    client.send({"t": "kicked", "reason": "session", "m": "already logged in"})
+                except Exception:
+                    pass
+                client.alive = False
+                try:
+                    client.sock.close()
+                except OSError:
+                    pass
+                return None
             try:
                 prev.sock.close()
             except OSError:
@@ -1577,7 +1676,38 @@ class SectorRoom:
 
 rooms: Dict[int, SectorRoom] = {}
 conn_meta: Dict[socket.socket, tuple] = {}
+# One live socket per callsign across all sectors.
+live_nicks: Dict[str, Tuple["Client", int]] = {}
 lock = threading.Lock()
+
+
+def nick_key(nick: str) -> str:
+    return str(nick or "").upper()
+
+
+def occupy_live_nick(key: str, client: Client, area: int) -> bool:
+    prev = live_nicks.get(key)
+    if prev:
+        old_client, old_area = prev
+        if old_client is client:
+            live_nicks[key] = (client, area)
+            return True
+        if old_client.alive:
+            try:
+                client.send({"t": "kicked", "reason": "session", "m": "already logged in"})
+            except Exception:
+                pass
+            client.alive = False
+            try:
+                client.sock.close()
+            except OSError:
+                pass
+            return False
+        if old_client.nick and old_area in rooms:
+            rooms[old_area].leave(old_client.nick)
+        live_nicks.pop(key, None)
+    live_nicks[key] = (client, area)
+    return True
 
 
 def get_room(area: int) -> SectorRoom:
@@ -1602,9 +1732,17 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
                 old = rooms[area]
                 old.leave(client.nick)
                 flush_rooms.append(old)
+            nick = str(msg.get("nick") or "")[:24]
+            key = nick_key(nick)
             area = int(msg.get("areaIndex") or 0)
+            if key and not occupy_live_nick(key, client, area):
+                return area
             room = get_room(area)
-            room.join(client, msg)
+            if not room.join(client, msg):
+                cur = live_nicks.get(key) if key else None
+                if cur and cur[0] is client:
+                    live_nicks.pop(key, None)
+                return area
             flush_rooms.append(room)
         elif client.nick is None or area is None:
             pass
@@ -1651,8 +1789,9 @@ def handle_message(client: Client, area: Optional[int], raw: str) -> Optional[in
                         room.leave(nick)
                         area = next_area
                         nxt = get_room(area)
-                        nxt.join(client, {**msg, "nick": nick, "areaIndex": area})
-                        flush_rooms.append(nxt)
+                        if nxt.join(client, {**msg, "nick": nick, "areaIndex": area}):
+                            flush_rooms.append(nxt)
+                            live_nicks[nick_key(nick)] = (client, area)
     # Send queued snapshots outside the lock so other rooms/clients are not stalled.
     seen = set()
     for room in flush_rooms:
@@ -1698,6 +1837,10 @@ def client_thread(sock: socket.socket) -> None:
             if client.nick is not None and area is not None and area in rooms:
                 left_room = rooms[area]
                 left_room.leave(client.nick)
+            key = nick_key(client.nick or "")
+            cur = live_nicks.get(key) if key else None
+            if cur and cur[0] is client:
+                live_nicks.pop(key, None)
         if left_room:
             left_room.flush_outbox()
         conn_meta.pop(sock, None)
@@ -1799,15 +1942,214 @@ def accept_ws(sock: socket.socket, req: bytes) -> bool:
         return False
 
 
+def recover_email_key(email: str) -> str:
+    return re.sub(r"[.#$\[\]/]", ",", str(email or "").strip().lower())
+
+
+def recover_hash(email: str, code: str) -> str:
+    return hashlib.sha256(f"sr-recover:{email}:{code}".encode("utf8")).hexdigest()
+
+
+def firebase_get(path: str):
+    url = f"{FIREBASE_DB}/{path}.json"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        raw = resp.read().decode("utf8") or "null"
+    return json.loads(raw)
+
+
+def firebase_set(path: str, value) -> None:
+    data = json.dumps(value).encode("utf8")
+    req = urllib.request.Request(
+        f"{FIREBASE_DB}/{path}.json",
+        data=data,
+        method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        resp.read()
+
+
+def send_recover_email(to: str, code: str, callsign: str) -> None:
+    subject = "Sector Rift password recovery"
+    text = (
+        f"Pilot {callsign},\n\nYour Sector Rift recovery code is {code}.\n"
+        "It expires in 15 minutes.\n\nIf you did not request this, you can ignore this email."
+    )
+    if SMTP_PASS:
+        msg = EmailMessage()
+        msg["From"] = SMTP_USER
+        msg["To"] = to
+        msg["Subject"] = subject
+        msg.set_content(text)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+        return
+    payload = json.dumps(
+        {
+            "from": MAIL_FROM,
+            "to": [to],
+            "subject": subject,
+            "text": text,
+        }
+    ).encode("utf8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            resp.read()
+    except urllib.error.HTTPError as err:
+        detail = err.read().decode("utf8", errors="ignore")
+        print(f"[recover] resend failed {err.code}: {detail[:300]}")
+        raise
+
+
+def _http_json(status: int, obj: dict, extra_headers: str = "") -> bytes:
+    body = json.dumps(obj)
+    return (
+        f"HTTP/1.1 {status} {'OK' if status < 400 else 'ERROR'}\r\n"
+        "Content-Type: application/json\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Access-Control-Allow-Methods: POST, OPTIONS\r\n"
+        "Access-Control-Allow-Headers: Content-Type\r\n"
+        f"{extra_headers}"
+        f"Content-Length: {len(body.encode('utf8'))}\r\n\r\n{body}"
+    ).encode("utf8")
+
+
+def read_http_body(sock: socket.socket, req: bytes) -> Tuple[str, str, dict]:
+    header_end = req.find(b"\r\n\r\n")
+    raw_headers = req[: header_end if header_end >= 0 else len(req)]
+    body = req[header_end + 4 :] if header_end >= 0 else b""
+    lines = raw_headers.decode("utf8", errors="ignore").split("\r\n")
+    first = lines[0].split(" ") if lines else []
+    method = first[0].upper() if first else "GET"
+    path = first[1] if len(first) > 1 else "/"
+    content_len = 0
+    for line in lines[1:]:
+        if line.lower().startswith("content-length:"):
+            try:
+                content_len = int(line.split(":", 1)[1].strip() or 0)
+            except ValueError:
+                content_len = 0
+    content_len = max(0, min(content_len, 8192))
+    while len(body) < content_len:
+        chunk = sock.recv(min(4096, content_len - len(body)))
+        if not chunk:
+            break
+        body += chunk
+    payload = {}
+    if body:
+        try:
+            parsed = json.loads(body.decode("utf8"))
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+    return method, path.split("?", 1)[0], payload
+
+
+def handle_recover(method: str, path: str, payload: dict) -> bytes:
+    if method == "OPTIONS":
+        return _http_json(204, {})
+    if method != "POST":
+        return _http_json(405, {"ok": False, "error": "method"})
+    if not SMTP_PASS and not RESEND_API_KEY:
+        return _http_json(503, {"ok": False, "error": "not_configured"})
+    try:
+        if path == "/recover/request":
+            email = str(payload.get("email") or "").strip().lower()
+            if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email):
+                return _http_json(200, {"ok": True})
+            key = recover_email_key(email)
+            now = time.time()
+            with _recover_lock:
+                last = _recover_last.get(key) or 0
+                if now - last < 60:
+                    return _http_json(200, {"ok": True})
+                _recover_last[key] = now
+            rec = firebase_get("emails/" + urllib.parse.quote(key, safe=""))
+            if not rec or not rec.get("callsign"):
+                return _http_json(200, {"ok": True})
+            callsign = str(rec.get("callsign") or "").strip().upper()
+            code = f"{random.randint(100000, 999999)}"
+            firebase_set(
+                "passwordResets/" + urllib.parse.quote(key, safe=""),
+                {
+                    "hash": recover_hash(email, code),
+                    "callsign": callsign,
+                    "expiresAt": int(now * 1000) + 15 * 60 * 1000,
+                    "attempts": 0,
+                },
+            )
+            send_recover_email(email, code, callsign)
+            return _http_json(200, {"ok": True})
+        if path == "/recover/confirm":
+            email = str(payload.get("email") or "").strip().lower()
+            code = str(payload.get("code") or "").strip()
+            password = str(payload.get("password") or "").strip()
+            if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", email) or not re.match(r"^\d{6}$", code) or len(password) < 4:
+                return _http_json(400, {"ok": False, "error": "invalid"})
+            key = recover_email_key(email)
+            rec = firebase_get("passwordResets/" + urllib.parse.quote(key, safe=""))
+            if not rec or not rec.get("hash") or int(rec.get("expiresAt") or 0) < int(time.time() * 1000):
+                return _http_json(400, {"ok": False, "error": "expired"})
+            attempts = int(rec.get("attempts") or 0)
+            reset_path = "passwordResets/" + urllib.parse.quote(key, safe="")
+            if attempts >= 5:
+                firebase_set(reset_path, None)
+                return _http_json(400, {"ok": False, "error": "expired"})
+            if rec.get("hash") != recover_hash(email, code):
+                rec["attempts"] = attempts + 1
+                firebase_set(reset_path, rec)
+                return _http_json(400, {"ok": False, "error": "invalid"})
+            callsign = str(rec.get("callsign") or "").strip().upper()
+            if not callsign:
+                return _http_json(400, {"ok": False, "error": "invalid"})
+            firebase_set("users/" + urllib.parse.quote(callsign, safe="") + "/warpKey", password)
+            firebase_set(reset_path, None)
+            return _http_json(200, {"ok": True})
+        return _http_json(404, {"ok": False, "error": "not_found"})
+    except Exception as err:
+        print(f"[recover] {type(err).__name__}: {err}")
+        return _http_json(500, {"ok": False, "error": "server"})
+
+
 def handle_http(sock: socket.socket, req: bytes) -> None:
     path = "/"
+    method = "GET"
+    payload: dict = {}
     try:
-        line = req.decode("utf8", errors="ignore").split("\r\n", 1)[0]
-        parts = line.split(" ")
-        if len(parts) >= 2:
-            path = parts[1]
+        method, path, payload = read_http_body(sock, req)
     except Exception:
-        pass
+        try:
+            line = req.decode("utf8", errors="ignore").split("\r\n", 1)[0]
+            parts = line.split(" ")
+            if len(parts) >= 2:
+                method = parts[0].upper()
+                path = parts[1].split("?", 1)[0]
+        except Exception:
+            pass
+    if path.startswith("/recover"):
+        resp = handle_recover(method, path, payload)
+        try:
+            sock.sendall(resp)
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError:
+            pass
+        return
     if path.startswith("/health"):
         with lock:
             players = sum(len(r.clients) for r in rooms.values())
@@ -1834,7 +2176,7 @@ def handle_http(sock: socket.socket, req: bytes) -> None:
             f"Access-Control-Allow-Origin: *\r\nContent-Length: {len(body)}\r\n\r\n{body}"
         )
     else:
-        body = "Star Raiders MP — server-owned world — connect via WebSocket\n"
+        body = "Sector Rift MP — server-owned world — connect via WebSocket\n"
         resp = (
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
             f"Content-Length: {len(body)}\r\n\r\n{body}"
@@ -1856,7 +2198,7 @@ def main() -> None:
     srv.bind(("0.0.0.0", PORT))
     srv.listen(64)
     print(
-        f"[Star Raiders MP] ws://0.0.0.0:{PORT}  enemyHz={ENEMY_HZ}  debrisHz={DEBRIS_HZ}  "
+        f"[Sector Rift MP] ws://0.0.0.0:{PORT}  enemyHz={ENEMY_HZ}  debrisHz={DEBRIS_HZ}  "
         "SERVER-OWNED ENEMIES+DEBRIS"
     )
     while True:
