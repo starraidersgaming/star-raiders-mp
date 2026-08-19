@@ -1995,6 +1995,7 @@ def send_recover_email(to: str, code: str, callsign: str) -> None:
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "sector-rift-mp/1.0",
         },
     )
     try:
