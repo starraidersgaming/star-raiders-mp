@@ -75,8 +75,8 @@ MINION_FIRE_MAX = 400.0
 LOOT_LAYOUT_VER = 1
 FIREBASE_DB = os.environ.get("FIREBASE_DB", "https://star-raiders-659bb-default-rtdb.firebaseio.com").rstrip("/")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
-MAIL_FROM = os.environ.get("MAIL_FROM", "Sector Rift <onboarding@resend.dev>").strip()
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.office365.com").strip()
+MAIL_FROM = os.environ.get("MAIL_FROM", "Sector Rift <noreply@sectorrift.com>").strip()
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp-mail.outlook.com").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "JumpingGoblinStudios@Outlook.com").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
@@ -1976,17 +1976,10 @@ def send_recover_email(to: str, code: str, callsign: str) -> None:
         f"Pilot {callsign},\n\nYour Sector Rift recovery code is {code}.\n"
         "It expires in 15 minutes.\n\nIf you did not request this, you can ignore this email."
     )
-    if SMTP_PASS:
-        msg = EmailMessage()
-        msg["From"] = SMTP_USER
-        msg["To"] = to
-        msg["Subject"] = subject
-        msg.set_content(text)
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
-            smtp.starttls()
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.send_message(msg)
-        return
+    if not RESEND_API_KEY:
+        err = RuntimeError("not_configured")
+        err.code = "not_configured"
+        raise err
     payload = json.dumps(
         {
             "from": MAIL_FROM,
@@ -2010,7 +2003,7 @@ def send_recover_email(to: str, code: str, callsign: str) -> None:
     except urllib.error.HTTPError as err:
         detail = err.read().decode("utf8", errors="ignore")
         print(f"[recover] resend failed {err.code}: {detail[:300]}")
-        raise
+        raise RuntimeError(f"resend {err.code}: {detail[:180]}")
 
 
 def _http_json(status: int, obj: dict, extra_headers: str = "") -> bytes:
@@ -2063,7 +2056,7 @@ def handle_recover(method: str, path: str, payload: dict) -> bytes:
         return _http_json(204, {})
     if method != "POST":
         return _http_json(405, {"ok": False, "error": "method"})
-    if not SMTP_PASS and not RESEND_API_KEY:
+    if not RESEND_API_KEY:
         return _http_json(503, {"ok": False, "error": "not_configured"})
     try:
         if path == "/recover/request":
@@ -2076,7 +2069,6 @@ def handle_recover(method: str, path: str, payload: dict) -> bytes:
                 last = _recover_last.get(key) or 0
                 if now - last < 60:
                     return _http_json(200, {"ok": True})
-                _recover_last[key] = now
             rec = firebase_get("emails/" + urllib.parse.quote(key, safe=""))
             if not rec or not rec.get("callsign"):
                 return _http_json(200, {"ok": True})
@@ -2092,6 +2084,9 @@ def handle_recover(method: str, path: str, payload: dict) -> bytes:
                 },
             )
             send_recover_email(email, code, callsign)
+            with _recover_lock:
+                _recover_last[key] = now
+            print(f"[recover] sent code to {email} for {callsign}")
             return _http_json(200, {"ok": True})
         if path == "/recover/confirm":
             email = str(payload.get("email") or "").strip().lower()
@@ -2121,7 +2116,7 @@ def handle_recover(method: str, path: str, payload: dict) -> bytes:
         return _http_json(404, {"ok": False, "error": "not_found"})
     except Exception as err:
         print(f"[recover] {type(err).__name__}: {err}")
-        return _http_json(500, {"ok": False, "error": "server"})
+        return _http_json(500, {"ok": False, "error": "server", "detail": str(err)[:220]})
 
 
 def handle_http(sock: socket.socket, req: bytes) -> None:
