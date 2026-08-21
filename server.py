@@ -343,14 +343,27 @@ def enemy_cap(area: int) -> int:
     return 150 if area == 0 else 110
 
 
-def type_for_area(area: int) -> dict:
+def area_enemy_rnd(area_index: int):
+    """Stable LCG so a freshly created sector always seeds the same patrol layout."""
+    seed = ((((int(area_index) + 1) * 2654435761) ^ 0xE11E1111) & 0xFFFFFFFF)
+
+    def rnd() -> float:
+        nonlocal seed
+        seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+        return seed / 4294967296.0
+
+    return rnd
+
+
+def type_for_area(area: int, rnd=None) -> dict:
+    r = rnd if callable(rnd) else random.random
     if area <= 0:
-        return ENEMY_TYPES[0] if random.random() < 0.7 else ENEMY_TYPES[1]
+        return ENEMY_TYPES[0] if r() < 0.7 else ENEMY_TYPES[1]
     # Match client: min(12, area) and next tier (13 = Core Sovereign; not bosses 14/15)
     de = min(12, max(0, area))
     a = ENEMY_TYPES[de]
     b = ENEMY_TYPES[min(13, de + 1)]
-    return a if random.random() < 0.6 else b
+    return a if r() < 0.6 else b
 
 
 def debris_count_for_area(area: int) -> int:
@@ -664,16 +677,21 @@ class SectorRoom:
     def seed_enemies(self) -> None:
         cap = enemy_cap(self.area_index)
         need = max(0, cap - len(self.enemy_ents))
-        for _ in range(need):
-            self.spawn_one()
+        rnd = area_enemy_rnd(self.area_index)
+        for i in range(need):
+            sid = f"s{self.area_index}_S_{i + 1}"
+            if sid in self.enemy_ents:
+                continue
+            self.spawn_one(rng=rnd, sid=sid)
         self.rebuild_enemy_snap()
 
-    def spawn_typed(self, typ: dict, x: float, y: float, *, ang: Optional[float] = None) -> str:
+    def spawn_typed(self, typ: dict, x: float, y: float, *, ang: Optional[float] = None, sid: Optional[str] = None) -> str:
         wand = ang if ang is not None else random.random() * math.pi * 2
         if abs(wand) < 0.2:
             wand = random.uniform(0.5, math.pi * 2 - 0.5)
-        sid = f"s{self.area_index}_{self.next_enemy_id}"
-        self.next_enemy_id += 1
+        if not sid:
+            sid = f"s{self.area_index}_{self.next_enemy_id}"
+            self.next_enemy_id += 1
         self.enemy_ents[sid] = {
             "id": sid,
             "t": typ["t"],
@@ -725,17 +743,21 @@ class SectorRoom:
                 return False
         return True
 
-    def spawn_one(self, avoid_x: Optional[float] = None, avoid_y: Optional[float] = None) -> None:
-        typ = type_for_area(self.area_index)
-        x = random.uniform(200, WORLD - 200)
-        y = random.uniform(200, WORLD - 200)
+    def spawn_one(self, avoid_x: Optional[float] = None, avoid_y: Optional[float] = None, rng=None, sid: Optional[str] = None) -> None:
+        pick = rng if callable(rng) else random.random
+        typ = type_for_area(self.area_index, pick)
+        x = 200 + pick() * (WORLD - 400)
+        y = 200 + pick() * (WORLD - 400)
         for _ in range(28):
-            cx = random.uniform(200, WORLD - 200)
-            cy = random.uniform(200, WORLD - 200)
+            cx = 200 + pick() * (WORLD - 400)
+            cy = 200 + pick() * (WORLD - 400)
             if self._spawn_point_ok(cx, cy, avoid_x, avoid_y):
                 x, y = cx, cy
                 break
-        self.spawn_typed(typ, x, y)
+        ang = pick() * math.pi * 2
+        if abs(ang) < 0.2:
+            ang = 0.5 + pick() * (math.pi * 2 - 1.0)
+        self.spawn_typed(typ, x, y, ang=ang, sid=sid)
 
     def spawn_minion(self, boss: dict) -> None:
         side = 1 if random.random() < 0.5 else -1
@@ -1039,10 +1061,15 @@ class SectorRoom:
         return sid
 
     def ore_yield_for(self, d: dict) -> int:
-        sc = float(d.get("sc") or 1)
-        # Rough match client getAsteroidOreYield scale mapping ~1–12
-        n = int(1 + sc * 4 + random.random() * 4)
-        return max(1, min(12, n))
+        sc = max(0.5, min(2.0, float(d.get("sc") or 1)))
+        # Match client getAsteroidOreYield: small 1–3, medium 2–4, large 3–5 (cap 5).
+        if sc < 1:
+            lo, hi = 1, 3
+        elif sc < 1.5:
+            lo, hi = 2, 4
+        else:
+            lo, hi = 3, 5
+        return max(1, min(5, random.randint(lo, hi)))
 
     def serialize_debris(self, d: dict) -> dict:
         # Keep fractional HP — int() truncation made 0.1..0.9 publish as 0 and
@@ -1850,8 +1877,8 @@ def client_thread(sock: socket.socket) -> None:
             pass
 
 
-# Empty sector rooms linger so a reconnect keeps the same enemy field.
-EMPTY_ROOM_GRACE_SEC = 90.0
+# Empty sector rooms linger so a reconnect / later login keeps the same enemy field.
+EMPTY_ROOM_GRACE_SEC = 24.0 * 3600.0
 
 
 def tick_loop() -> None:
